@@ -160,7 +160,7 @@ const Station STATIONS[] = {
   {"MOSAIQUE",  "Tunisia",     "TUNIS",        "https://radio.mosaiquefm.net/mosalive"},
   {"MEDINA",    "Morocco",     "MARRAKECH",    "https://cast5.my-control-panel.com/proxy/marrakec/stream"},
   {"DAKAR",     "Senegal",     "DAKAR",        "http://listen.senemultimedia.net:8090/stream"},
-  {"AFRICANA",  "Uganda",      "KAMPALA",      "http://streams.radiomast.io/9d26e133-9973-4261-b1e0-12fe4e0f3c34"},
+  {"AKABOOZI",  "Uganda",      "KAMPALA",      "http://162.244.80.52:8732/stream"},
   {"AL BAL",    "Lebanon",     "BEIRUT",       "https://albal-lbnet2.radioca.st/stream"},
   {"TOKYO",     "Japan",       "TOKYO",        "https://freefm80.radioca.st/"},
   {"CKUT",      "Canada",      "MONTREAL",     "https://ckut.out.airtime.pro/ckut_a"},
