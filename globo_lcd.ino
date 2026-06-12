@@ -259,10 +259,12 @@ struct Blob {
 };
 Blob blobs[NUM_BLOBS];
 
-uint8_t curR[NUM_BLOBS], curG[NUM_BLOBS], curB[NUM_BLOBS];
+// Color state is float so colors can ease forever (lava lamp): each blob
+// always drifts toward its target, and every few seconds one blob quietly
+// picks a fresh target. Station changes just retarget all five at once.
+float curR[NUM_BLOBS], curG[NUM_BLOBS], curB[NUM_BLOBS];
 uint8_t tgtR[NUM_BLOBS], tgtG[NUM_BLOBS], tgtB[NUM_BLOBS];
-int transFrames = 0;
-#define TRANS_LEN 60
+uint32_t nextRetargetMs = 0;
 
 void initBlobs(int pal) {
   for (int i = 0; i < NUM_BLOBS; i++) {
@@ -276,7 +278,7 @@ void initBlobs(int pal) {
     blobs[i].g = palettes[pal][i][1];
     blobs[i].b = palettes[pal][i][2];
     curR[i] = blobs[i].r; curG[i] = blobs[i].g; curB[i] = blobs[i].b;
-    tgtR[i] = curR[i]; tgtG[i] = curG[i]; tgtB[i] = curB[i];
+    tgtR[i] = blobs[i].r; tgtG[i] = blobs[i].g; tgtB[i] = blobs[i].b;
   }
 }
 
@@ -298,7 +300,6 @@ void shuffleGradient() {
     blobs[i].vy = (random(100) - 50) / 40.0;
     blobs[i].baseRad = random(130, 210);
   }
-  transFrames = TRANS_LEN;
 }
 
 // dt is in "design frames" (55ms units) so blob speed stays the same however
@@ -316,23 +317,32 @@ void updateBlobs(float dt) {
     blobs[i].vy += dt * (random(100) - 50) / 1500.0;
     blobs[i].vx = constrain(blobs[i].vx, -2.5f, 2.5f);
     blobs[i].vy = constrain(blobs[i].vy, -2.0f, 2.0f);
+    // Sizes wander slowly too
+    blobs[i].baseRad += dt * (random(100) - 50) * 0.01f;
+    blobs[i].baseRad = constrain(blobs[i].baseRad, 115.0f, 225.0f);
   }
 
-  if (transFrames > 0) {
-    transFrames -= (int)dt; if (transFrames < 0) transFrames = 0;
-    float t = 1.0 - (float)transFrames / TRANS_LEN;
-    t = t * (2.0 - t);
-    for (int i = 0; i < NUM_BLOBS; i++) {
-      blobs[i].r = curR[i] + (int)((tgtR[i] - curR[i]) * t);
-      blobs[i].g = curG[i] + (int)((tgtG[i] - curG[i]) * t);
-      blobs[i].b = curB[i] + (int)((tgtB[i] - curB[i]) * t);
-    }
-    if (transFrames == 0) {
-      for (int i = 0; i < NUM_BLOBS; i++) {
-        curR[i] = tgtR[i]; curG[i] = tgtG[i]; curB[i] = tgtB[i];
-        blobs[i].r = curR[i]; blobs[i].g = curG[i]; blobs[i].b = curB[i];
-      }
-    }
+  // Lava lamp: colors ease toward their targets forever (~2.5s to settle
+  // after a station change, imperceptibly smooth in between)...
+  float k = 1.0f - powf(0.95f, dt);
+  for (int i = 0; i < NUM_BLOBS; i++) {
+    curR[i] += (tgtR[i] - curR[i]) * k;
+    curG[i] += (tgtG[i] - curG[i]) * k;
+    curB[i] += (tgtB[i] - curB[i]) * k;
+    blobs[i].r = (uint8_t)(curR[i] + 0.5f);
+    blobs[i].g = (uint8_t)(curG[i] + 0.5f);
+    blobs[i].b = (uint8_t)(curB[i] + 0.5f);
+  }
+  // ...and every few seconds one blob quietly picks a fresh color so the
+  // gradient never sits still between stations.
+  if (millis() > nextRetargetMs) {
+    nextRetargetMs = millis() + 5000 + random(8000);
+    int i = random(NUM_BLOBS);
+    int pal = random(NUM_PALETTES);
+    int ci = random(5);
+    tgtR[i] = palettes[pal][ci][0];
+    tgtG[i] = palettes[pal][ci][1];
+    tgtB[i] = palettes[pal][ci][2];
   }
 }
 
@@ -480,12 +490,13 @@ void renderTextMask(const char* text, const GFXfont* font,
 // 2x2-sample threshold skipped source rows, so thin strokes of the Light
 // weights dropped out and edges stair-stepped), then the text color is
 // blended onto the gradient by coverage: proper anti-aliasing.
-void blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
-              int destX, int destY, int destW, int destH, uint16_t color) {
-  if (inkW <= 0 || inkH <= 0 || destW <= 0 || destH <= 0) return;
+int blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
+             int destX, int destY, int destW, int destH, uint16_t color) {
+  if (inkW <= 0 || inkH <= 0 || destW <= 0 || destH <= 0) return -1;
   uint16_t* mb = (uint16_t*)mask.getPointer();
   uint16_t* fb = (uint16_t*)spr.getPointer();
-  if (!mb || !fb) return;
+  if (!mb || !fb) return -2;
+  int painted = 0;
   int mw = mask.width();
   uint16_t bgVal = mb[0];
   uint16_t col = swap16(color);
@@ -495,39 +506,58 @@ void blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
   int endX = inkX + inkW;
   int endY = inkY + inkH;
 
+  // 8.8 fixed-point area sampling: every destination pixel averages its TRUE
+  // fractional source window, with partial pixels weighted by overlap. The
+  // previous integer-aligned box alternated 2px/3px footprints at scale
+  // factors between 1x and 2x, which made stroke weight wobble — the
+  // "glitchy" look. A minimum ~1.25px window keeps upscaled text smooth.
+  uint32_t xStep = ((uint32_t)inkW << 8) / destW;
+  uint32_t yStep = ((uint32_t)inkH << 8) / destH;
+  uint32_t xWin = xStep < 320 ? 320 : xStep;
+  uint32_t yWin = yStep < 320 ? 320 : yStep;
+  const int32_t xMax = (int32_t)inkW << 8;
+  const int32_t yMax = (int32_t)inkH << 8;
+
   for (int dy = 0; dy < destH; dy++) {
     int py = destY + dy;
     if (py < 0 || py >= SH) continue;
-    int syA = inkY + (int)((long)dy * inkH / destH);
-    int syB = inkY + (int)((long)(dy + 1) * inkH / destH);
-    if (syB <= syA + 1) syB = syA + 2;   // min 2px footprint: smooths upscale too
-    if (syB > endY) syB = endY;
-    if (syB <= syA) syB = syA + 1;
+    int32_t cy = (int32_t)(dy * yStep) + (int32_t)(yStep >> 1);
+    int32_t y0 = cy - (int32_t)(yWin >> 1);
+    if (y0 < 0) y0 = 0;
+    int32_t y1 = y0 + (int32_t)yWin;
+    if (y1 > yMax) { y1 = yMax; y0 = max((int32_t)0, y1 - (int32_t)yWin); }
+    int syA = y0 >> 8, syB = (y1 - 1) >> 8;
     uint16_t* out = fb + py * SW;
 
     for (int dx = 0; dx < destW; dx++) {
       int px = destX + dx;
       if (px < 0 || px >= SW) continue;
-      int sxA = inkX + (int)((long)dx * inkW / destW);
-      int sxB = inkX + (int)((long)(dx + 1) * inkW / destW);
-      if (sxB <= sxA + 1) sxB = sxA + 2;   // min 2px footprint
-      if (sxB > endX) sxB = endX;
-      if (sxB <= sxA) sxB = sxA + 1;
+      int32_t cx = (int32_t)(dx * xStep) + (int32_t)(xStep >> 1);
+      int32_t x0 = cx - (int32_t)(xWin >> 1);
+      if (x0 < 0) x0 = 0;
+      int32_t x1 = x0 + (int32_t)xWin;
+      if (x1 > xMax) { x1 = xMax; x0 = max((int32_t)0, x1 - (int32_t)xWin); }
+      int sxA = x0 >> 8, sxB = (x1 - 1) >> 8;
 
-      int ink = 0, total = 0;
-      for (int sy = syA; sy < syB; sy++) {
-        const uint16_t* row = mb + sy * mw;
-        for (int sx = sxA; sx < sxB; sx++) {
-          if (row[sx] != bgVal) ink++;
-          total++;
+      uint32_t inkAcc = 0, totAcc = 0;
+      for (int sy = syA; sy <= syB; sy++) {
+        int32_t q0 = sy << 8;
+        uint32_t wy = (uint32_t)(min(y1, q0 + 256) - max(y0, q0));
+        const uint16_t* row = mb + (inkY + sy) * mw + inkX;
+        for (int sx = sxA; sx <= sxB; sx++) {
+          int32_t p0 = sx << 8;
+          uint32_t w = wy * (uint32_t)(min(x1, p0 + 256) - max(x0, p0));
+          totAcc += w;
+          if (row[sx] != bgVal) inkAcc += w;
         }
       }
-      if (ink == 0) continue;
+      if (inkAcc == 0 || totAcc == 0) continue;
+      painted++;
 
-      if (ink == total) {
+      if (inkAcc >= totAcc) {
         out[px] = col;            // fully covered — solid text color
       } else {
-        int a = ink * 255 / total;
+        int a = (int)((uint64_t)inkAcc * 255 / totAcc);
         uint16_t bgc = swap16(out[px]);
         int br = ((bgc >> 11) & 0x1F) << 3;
         int bg = ((bgc >>  5) & 0x3F) << 2;
@@ -539,6 +569,7 @@ void blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
       }
     }
   }
+  return painted;
 }
 
 // Randomized layout params per station
@@ -569,6 +600,10 @@ void cacheTextMasks() {
                  nameMask, nameInkX, nameInkY, nameInkW, nameInkH);
   renderTextMask(STATIONS[currentStation].city, fonts32[cityFont],
                  cityMask, cityInkX, cityInkY, cityInkW, cityInkH);
+  Serial.printf("[typo] '%s' f=%d ink=%dx%d | '%s' f=%d ink=%dx%d | pad=%d nameH=%d cityH=%d\n",
+                STATIONS[currentStation].name, nameFont, nameInkW, nameInkH,
+                STATIONS[currentStation].city, cityFont, cityInkW, cityInkH,
+                layoutPad, nameH, cityH);
 }
 
 // Overlay text (volume / alarm time), re-rendered only when the string changes.
@@ -702,6 +737,7 @@ void drawWifiResetCard() {
 
 // Per-stage render profiling, printed with the [ui] heartbeat line
 uint32_t g_gradMs = 0, g_textMs = 0, g_pushMs = 0;
+int g_namePx = 0, g_cityPx = 0;   // pixels the last frame actually painted
 
 // ── Main render ──────────────────────────────────────────
 void renderFrame() {
@@ -758,9 +794,9 @@ void renderFrame() {
     int nameH = totalH * layoutNamePct / 100;
     int cityH = totalH - nameH - layoutGap;
 
-    blitMask(nameMask, nameInkX, nameInkY, nameInkW, nameInkH,
+    g_namePx = blitMask(nameMask, nameInkX, nameInkY, nameInkW, nameInkH,
              layoutPad, layoutPad, SW - layoutPad * 2, nameH, TFT_BLACK);
-    blitMask(cityMask, cityInkX, cityInkY, cityInkW, cityInkH,
+    g_cityPx = blitMask(cityMask, cityInkX, cityInkY, cityInkW, cityInkH,
              layoutPad, layoutPad + nameH + layoutGap, SW - layoutPad * 2, cityH, TFT_BLACK);
 
     if (uiMode == MODE_STATION) {
@@ -817,7 +853,18 @@ void stepBacklight() {
   if (step < 1) step = 1;
   if (goingUp) g_blCurrent = min(g_blCurrent + step, g_blTarget);
   else         g_blCurrent = max(g_blCurrent - step, g_blTarget);
-  ledcWrite(PIN_BACKLIGHT, (uint32_t)g_blCurrent);
+
+  // At zero, drop out of PWM and drive the pin hard LOW — the panel stayed
+  // visibly lit while LEDC claimed duty 0, so trust plain GPIO instead.
+  static bool blPwm = true;
+  if (g_blCurrent == 0) {
+    if (blPwm) { ledcDetach(PIN_BACKLIGHT); blPwm = false; }
+    pinMode(PIN_BACKLIGHT, OUTPUT);
+    digitalWrite(PIN_BACKLIGHT, LOW);
+  } else {
+    if (!blPwm) { ledcAttach(PIN_BACKLIGHT, 2000, 8); blPwm = true; }
+    ledcWrite(PIN_BACKLIGHT, (uint32_t)g_blCurrent);
+  }
 }
 
 void wakeScreen() {
@@ -1489,11 +1536,11 @@ void loop() {
                   (unsigned)audio.getBitRate(), (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getFreePsram());
     uint32_t fc = g_frameCount ? g_frameCount : 1;
-    Serial.printf("[ui] fps=%.1f avgRender=%ums (grad=%u text=%u push=%u) awake=%d bl=%d mode=%d encIsr=%u loading=%d\n",
+    Serial.printf("[ui] fps=%.1f avgRender=%ums (grad=%u text=%u push=%u) namePx=%d cityPx=%d awake=%d bl=%d mode=%d encIsr=%u loading=%d\n",
                   g_frameCount / 3.0f,
                   g_frameCount ? (unsigned)(g_renderMsAcc / g_frameCount) : 0,
                   (unsigned)(g_gradMs / fc), (unsigned)(g_textMs / fc),
-                  (unsigned)(g_pushMs / fc),
+                  (unsigned)(g_pushMs / fc), g_namePx, g_cityPx,
                   (int)screenAwake, g_blCurrent, (int)uiMode,
                   (unsigned)encIsrCount, (int)g_loading);
     g_frameCount = 0;
