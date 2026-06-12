@@ -319,7 +319,7 @@ void updateBlobs(float dt) {
     blobs[i].vy = constrain(blobs[i].vy, -2.0f, 2.0f);
     // Sizes wander slowly too
     blobs[i].baseRad += dt * (random(100) - 50) * 0.01f;
-    blobs[i].baseRad = constrain(blobs[i].baseRad, 115.0f, 225.0f);
+    blobs[i].baseRad = constrain(blobs[i].baseRad, 130.0f, 225.0f);
   }
 
   // Lava lamp: colors ease toward their targets forever (~2.5s to settle
@@ -394,6 +394,8 @@ void renderGradient() {
         uint32_t w = (rs << 8) / denom;
         w = (w * w) >> 8;
         w = (w * w) >> 8;  // ^4 for lava lamp sharpness
+        if (w == 0) w = 1; // floor: far pixels average the blob colors
+                           // instead of underflowing to black waves
         rAcc += blobs[i].r * w;
         gAcc += blobs[i].g * w;
         bAcc += blobs[i].b * w;
@@ -617,8 +619,8 @@ void cacheOverlayMask(const char* str) {
 void drawBatteryIcon(int x, int y, int pct) {
   if (pct < 0) return;
   int w = 20, h = 10;
-  spr.drawRoundRect(x, y, w, h, 2, TFT_BLACK);
-  spr.fillRect(x + w, y + 3, 2, 4, TFT_BLACK);
+  spr.drawRoundRect(x, y, w, h, 2, TFT_WHITE);
+  spr.fillRect(x + w, y + 3, 2, 4, TFT_WHITE);
   int fillW = ((w - 4) * pct + 50) / 100;
   uint16_t col = spr.color565(20, 120, 40);
   if (pct <= 10) col = spr.color565(220, 30, 30);
@@ -749,13 +751,13 @@ void renderFrame() {
   if (uiMode == MODE_MENU) {
     // Settings the globo way: one big stretched word per item, spin to browse.
     cacheOverlayMask(MENU_ITEMS[menuIdx]);
-    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 30, 45, SW - 60, 80, TFT_BLACK);
+    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 30, 45, SW - 60, 80, TFT_WHITE);
 
     char buf[24];
     snprintf(buf, sizeof(buf), "%d / %d", menuIdx + 1, MENU_COUNT);
     spr.setTextDatum(TC_DATUM);
     spr.setFreeFont(&FreeSansBold9pt7b);
-    spr.setTextColor(TFT_BLACK);
+    spr.setTextColor(TFT_WHITE);
     spr.drawString("SETTINGS", SW / 2, 18);
     spr.drawString(buf, SW / 2, 142);
   } else if (uiMode == MODE_INFO_NET) {
@@ -769,11 +771,11 @@ void renderFrame() {
     char buf[8];
     snprintf(buf, sizeof(buf), "%02d:%02d", alarmHour, alarmMinute);
     cacheOverlayMask(buf);
-    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 40, 50, SW - 80, 80, TFT_BLACK);
+    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 40, 50, SW - 80, 80, TFT_WHITE);
 
     spr.setTextDatum(TC_DATUM);
     spr.setFreeFont(&FreeSansBold9pt7b);
-    spr.setTextColor(TFT_BLACK);
+    spr.setTextColor(TFT_WHITE);
     spr.drawString("ALARM", SW / 2, 18);
     spr.drawString(alarmArmed ? "ON - press to disarm" : "OFF - press to arm", SW / 2, 142);
   } else if (millis() < volOverlayUntil) {
@@ -781,11 +783,11 @@ void renderFrame() {
     char buf[8];
     snprintf(buf, sizeof(buf), "%d", volumeLevel * 100 / 21);
     cacheOverlayMask(buf);
-    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 70, 40, SW - 140, 90, TFT_BLACK);
+    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 70, 40, SW - 140, 90, TFT_WHITE);
 
     spr.setTextDatum(TC_DATUM);
     spr.setFreeFont(&FreeSansBold9pt7b);
-    spr.setTextColor(TFT_BLACK);
+    spr.setTextColor(TFT_WHITE);
     spr.drawString("VOLUME", SW / 2, 142);
   } else {
     cacheTextMasks();
@@ -795,16 +797,16 @@ void renderFrame() {
     int cityH = totalH - nameH - layoutGap;
 
     g_namePx = blitMask(nameMask, nameInkX, nameInkY, nameInkW, nameInkH,
-             layoutPad, layoutPad, SW - layoutPad * 2, nameH, TFT_BLACK);
+             layoutPad, layoutPad, SW - layoutPad * 2, nameH, TFT_WHITE);
     g_cityPx = blitMask(cityMask, cityInkX, cityInkY, cityInkW, cityInkH,
-             layoutPad, layoutPad + nameH + layoutGap, SW - layoutPad * 2, cityH, TFT_BLACK);
+             layoutPad, layoutPad + nameH + layoutGap, SW - layoutPad * 2, cityH, TFT_WHITE);
 
     if (uiMode == MODE_STATION) {
       char buf[24];
       snprintf(buf, sizeof(buf), "STATION %d / %d", currentStation + 1, STATION_COUNT);
       spr.setTextDatum(TC_DATUM);
       spr.setFreeFont(&FreeSansBold9pt7b);
-      spr.setTextColor(TFT_BLACK);
+      spr.setTextColor(TFT_WHITE);
       spr.drawString(buf, SW / 2, 18);
     }
   }
@@ -815,7 +817,7 @@ void renderFrame() {
     snprintf(buf, sizeof(buf), "%02d:%02d", alarmHour, alarmMinute);
     spr.setTextDatum(TL_DATUM);
     spr.setFreeFont(&FreeSansBold9pt7b);
-    spr.setTextColor(TFT_BLACK);
+    spr.setTextColor(TFT_WHITE);
     spr.drawString(buf, 6, 5);
   }
   if (g_batPct >= 0 && g_batPct <= 25) drawBatteryIcon(SW - 28, 5, g_batPct);
