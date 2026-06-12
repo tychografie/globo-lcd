@@ -467,9 +467,11 @@ void renderTextMask(const char* text, const GFXfont* font,
   inkH = maxY - minY + 1;
 }
 
-// 2x2 supersampled stretch, threshold at >=2/4 for a clean edge.
-// Reads the mask and writes the framebuffer directly — readPixel/drawPixel
-// per destination pixel was the single hottest path in the whole render.
+// Box-filtered stretch with alpha blending. Each destination pixel averages
+// its FULL source footprint (the masks are usually downscaled — the old
+// 2x2-sample threshold skipped source rows, so thin strokes of the Light
+// weights dropped out and edges stair-stepped), then the text color is
+// blended onto the gradient by coverage: proper anti-aliasing.
 void blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
               int destX, int destY, int destW, int destH, uint16_t color) {
   if (inkW <= 0 || inkH <= 0 || destW <= 0 || destH <= 0) return;
@@ -479,30 +481,54 @@ void blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
   int mw = mask.width();
   uint16_t bgVal = mb[0];
   uint16_t col = swap16(color);
-  int mxX = inkX + inkW - 1;
-  int mxY = inkY + inkH - 1;
+  int tr = ((color >> 11) & 0x1F) << 3;
+  int tg = ((color >>  5) & 0x3F) << 2;
+  int tb = ( color        & 0x1F) << 3;
+  int endX = inkX + inkW;
+  int endY = inkY + inkH;
 
   for (int dy = 0; dy < destH; dy++) {
     int py = destY + dy;
     if (py < 0 || py >= SH) continue;
-    int sY  = inkY + (int)((long)dy * inkH / destH);
-    int sY1 = min(sY + 1, mxY);
-    const uint16_t* r0 = mb + sY  * mw;
-    const uint16_t* r1 = mb + sY1 * mw;
+    int syA = inkY + (int)((long)dy * inkH / destH);
+    int syB = inkY + (int)((long)(dy + 1) * inkH / destH);
+    if (syB <= syA + 1) syB = syA + 2;   // min 2px footprint: smooths upscale too
+    if (syB > endY) syB = endY;
+    if (syB <= syA) syB = syA + 1;
     uint16_t* out = fb + py * SW;
+
     for (int dx = 0; dx < destW; dx++) {
       int px = destX + dx;
       if (px < 0 || px >= SW) continue;
-      int sX  = inkX + (int)((long)dx * inkW / destW);
-      int sX1 = min(sX + 1, mxX);
+      int sxA = inkX + (int)((long)dx * inkW / destW);
+      int sxB = inkX + (int)((long)(dx + 1) * inkW / destW);
+      if (sxB <= sxA + 1) sxB = sxA + 2;   // min 2px footprint
+      if (sxB > endX) sxB = endX;
+      if (sxB <= sxA) sxB = sxA + 1;
 
-      int c = 0;
-      if (r0[sX]  != bgVal) c++;
-      if (r0[sX1] != bgVal) c++;
-      if (r1[sX]  != bgVal) c++;
-      if (r1[sX1] != bgVal) c++;
+      int ink = 0, total = 0;
+      for (int sy = syA; sy < syB; sy++) {
+        const uint16_t* row = mb + sy * mw;
+        for (int sx = sxA; sx < sxB; sx++) {
+          if (row[sx] != bgVal) ink++;
+          total++;
+        }
+      }
+      if (ink == 0) continue;
 
-      if (c >= 2) out[px] = col;
+      if (ink == total) {
+        out[px] = col;            // fully covered — solid text color
+      } else {
+        int a = ink * 255 / total;
+        uint16_t bgc = swap16(out[px]);
+        int br = ((bgc >> 11) & 0x1F) << 3;
+        int bg = ((bgc >>  5) & 0x3F) << 2;
+        int bb = ( bgc        & 0x1F) << 3;
+        out[px] = swap16(spr.color565(
+          (tr * a + br * (255 - a)) / 255,
+          (tg * a + bg * (255 - a)) / 255,
+          (tb * a + bb * (255 - a)) / 255));
+      }
     }
   }
 }
