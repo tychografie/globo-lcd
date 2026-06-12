@@ -435,6 +435,10 @@ void renderTextMask(const char* text, const GFXfont* font,
   mask.deleteSprite();
   mask.setColorDepth(16);
   mask.createSprite(sprW, sprH);
+  Serial.printf("[mask] '%s' %dx%d (%uKB) ptr=%p heap=%u psram=%u\n",
+                text, sprW, sprH, (unsigned)(sprW * sprH * 2 / 1024),
+                mask.getPointer(), (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getFreePsram());
   mask.fillSprite(TFT_BLACK);
   mask.setFreeFont(font);
   mask.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -459,7 +463,11 @@ void renderTextMask(const char* text, const GFXfont* font,
       }
     }
   }
-  if (maxX <= minX || maxY <= minY) { inkW = 0; return; }
+  if (maxX <= minX || maxY <= minY) {
+    Serial.printf("[mask] '%s' NO INK FOUND\n", text);
+    inkW = 0;
+    return;
+  }
   minX = max(0, minX - 1); minY = max(0, minY - 1);
   maxX = min(sprW - 1, maxX + 1); maxY = min(sprH - 1, maxY + 1);
   inkX = minX; inkY = minY;
@@ -542,12 +550,20 @@ void cacheTextMasks() {
   if (cachedStation == currentStation) return;
   cachedStation = currentStation;
 
-  int nameFont = random(NUM_FONTS);
-  int cityFont = random(NUM_FONTS);
+  // Layout first, fonts second: the old pad range (50-70) could squeeze the
+  // name into a ~15px band where it read as a smear — "the name never shows".
+  layoutPad = random(24, 44);
+  layoutGap = random(4, 10);
+  layoutNamePct = random(48, 68);
 
-  layoutPad = random(50, 70);
-  layoutGap = random(2, 10);
-  layoutNamePct = random(42, 72);
+  int totalH = SH - layoutPad * 2;
+  int nameH = totalH * layoutNamePct / 100;
+  int cityH = totalH - nameH - layoutGap;
+
+  // Light weights vanish below ~45px of height; bias to the heavy faces then.
+  static const int HEAVY[] = {0, 1, 3, 5};   // Black/Medium cuts
+  int nameFont = (nameH < 45) ? HEAVY[random(4)] : random(NUM_FONTS);
+  int cityFont = (cityH < 30) ? HEAVY[random(4)] : random(NUM_FONTS);
 
   renderTextMask(STATIONS[currentStation].name, fonts56[nameFont],
                  nameMask, nameInkX, nameInkY, nameInkW, nameInkH);
