@@ -17,13 +17,13 @@
  *   EC11 / KY-040 rotary encoder                — on the P2 header (top, by 3V)
  *   JST 1.25mm 3.7V 1200mAh LiPo, extra USB-C wired to the onboard USB pads
  *
- * Controls:
- *   encoder rotate            volume
- *   encoder press             shuffle to a random station
- *   encoder long-press (1.2s) alarm-set mode (rotate = time, press = arm/disarm)
- *   left button (GPIO 0)      previous station
- *   right button (GPIO 14)    next station
- *   hold right button at boot wipe saved WiFi credentials
+ * Controls — EC11 only (the onboard buttons are behind the enclosure):
+ *   rotate                    volume
+ *   short press               shuffle to a random station
+ *   long press (1.2s)         settings menu (ported from globo-eink):
+ *                             ALARM / STATIONS / NETWORK / BATTERY / WIFI RESET
+ *                             rotate = browse, press = select, long = back
+ *   hold encoder at boot      wipe saved WiFi credentials
  */
 
 #include <TFT_eSPI.h>
@@ -82,8 +82,6 @@ const GFXfont* fonts32[] = {
 // native USB-CDC, so nothing is lost.
 #define PIN_POWER_ON  15
 #define PIN_BACKLIGHT 38   // TFT_BL — PWM dim/off for screen timeout
-#define BTN_LEFT      0
-#define BTN_RIGHT     14
 #define I2S_BCLK      44
 #define I2S_LRC       43
 #define I2S_DOUT      18
@@ -181,8 +179,23 @@ int currentStation = 0;   // randomized in setup() — shuffle on every boot
 // ── State ────────────────────────────────────────────────
 Preferences prefs;
 
-enum UiMode { MODE_RADIO, MODE_ALARM_SET };
+enum UiMode {
+  MODE_RADIO,        // gradient + station typography
+  MODE_MENU,         // settings: spin through big stretched menu words
+  MODE_STATION,      // browse stations sequentially, debounced connect
+  MODE_ALARM_SET,    // rotate = time, press = arm/disarm
+  MODE_INFO_NET,     // SSID / IP / signal card
+  MODE_INFO_BAT,     // voltage / charge card
+  MODE_WIFI_RESET,   // No/Yes confirmation, then wipe + restart
+};
 UiMode uiMode = MODE_RADIO;
+
+const char* MENU_ITEMS[] = {"ALARM", "STATIONS", "NETWORK", "BATTERY", "WIFI RESET", "BACK"};
+#define MENU_COUNT 6
+int  menuIdx = 0;
+bool wifiResetYes = false;          // selection on the confirm screen
+uint32_t uiLastInputMs = 0;         // mode-timeout bookkeeping
+uint32_t stationConnectAtMs = 0;    // debounced connect while browsing
 
 int  volumeLevel = 12;             // 0..21 (mirrors audio.setVolume)
 int  alarmHour   = 8;
@@ -204,7 +217,6 @@ uint32_t fadeStartMs  = 0;
 #define FADE_DURATION_MS 20000
 
 uint32_t lastAlarmChange   = 0;   // 10s guard against trigger-while-adjusting
-uint32_t alarmModeLastMs   = 0;   // auto-exit alarm-set mode after idle
 uint32_t volOverlayUntil   = 0;   // transient volume overlay
 uint32_t lastFrame = 0, lastSecond = 0, lastHeartbeat = 0;
 unsigned long animFrame = 0;
@@ -517,11 +529,89 @@ void drawSpinner(int cx, int cy, int r) {
   }
 }
 
+// ── Info cards (settings screens ported from globo-eink) ─
+void drawCardBase() {
+  spr.fillRoundRect(10, 10, SW - 20, SH - 20, 8, TFT_WHITE);
+  spr.drawRoundRect(10, 10, SW - 20, SH - 20, 8, TFT_BLACK);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(TFT_BLACK);
+}
+
+void drawNetworkCard() {
+  drawCardBase();
+  spr.setFreeFont(&FreeSansBold9pt7b);
+  spr.drawString("Network", 24, 24);
+  spr.setFreeFont(&FreeSans9pt7b);
+  spr.drawString("SSID: " + WiFi.SSID(), 24, 56);
+  spr.drawString("IP: " + WiFi.localIP().toString(), 24, 80);
+  int rssi = WiFi.RSSI();
+  const char* quality = rssi > -50 ? "Excellent" : rssi > -60 ? "Good"
+                      : rssi > -70 ? "Fair" : "Weak";
+  spr.drawString("Signal: " + String(rssi) + " dBm (" + quality + ")", 24, 104);
+  spr.setTextColor(spr.color565(120, 120, 120));
+  spr.drawString("press: back", 24, 134);
+}
+
+void drawBatteryCard() {
+  drawCardBase();
+  spr.setFreeFont(&FreeSansBold9pt7b);
+  spr.drawString("Battery", 24, 24);
+  spr.setFreeFont(&FreeSans9pt7b);
+  spr.drawString("Voltage: " + String(g_batMvEma / 1000.0f, 2) + " V", 24, 56);
+  spr.drawString("Charge: " + String(g_batPct) + "%", 24, 80);
+  // GPIO4 reads roughly VBUS/2 when USB is feeding the board and no cell
+  // is fitted, so anything above the LiPo ceiling means external power.
+  spr.drawString(String("Source: ") + (g_batMvEma >= 4300 ? "USB" : "Battery"), 24, 104);
+  spr.setTextColor(spr.color565(120, 120, 120));
+  spr.drawString("press: back", 24, 134);
+}
+
+void drawWifiResetCard() {
+  drawCardBase();
+  spr.setFreeFont(&FreeSansBold9pt7b);
+  spr.drawString("WiFi Reset", 24, 24);
+  spr.setFreeFont(&FreeSans9pt7b);
+  spr.drawString("Forget all networks and", 24, 52);
+  spr.drawString("restart the device?", 24, 74);
+
+  int yNo = 104, yYes = 130, rowH = 22;
+  if (!wifiResetYes) {
+    spr.fillRoundRect(20, yNo - 4, 120, rowH, 4, TFT_BLACK);
+    spr.setTextColor(TFT_WHITE);
+    spr.drawString("> No", 28, yNo);
+    spr.setTextColor(TFT_BLACK);
+    spr.drawString("Yes", 28, yYes);
+  } else {
+    spr.drawString("No", 28, yNo);
+    spr.fillRoundRect(20, yYes - 4, 120, rowH, 4, TFT_BLACK);
+    spr.setTextColor(TFT_WHITE);
+    spr.drawString("> Yes", 28, yYes);
+  }
+}
+
 // ── Main render ──────────────────────────────────────────
 void renderFrame() {
   renderGradient();
 
-  if (uiMode == MODE_ALARM_SET) {
+  if (uiMode == MODE_MENU) {
+    // Settings the globo way: one big stretched word per item, spin to browse.
+    cacheOverlayMask(MENU_ITEMS[menuIdx]);
+    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 30, 45, SW - 60, 80, TFT_BLACK);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d / %d", menuIdx + 1, MENU_COUNT);
+    spr.setTextDatum(TC_DATUM);
+    spr.setFreeFont(&FreeSansBold9pt7b);
+    spr.setTextColor(TFT_BLACK);
+    spr.drawString("SETTINGS", SW / 2, 18);
+    spr.drawString(buf, SW / 2, 142);
+  } else if (uiMode == MODE_INFO_NET) {
+    drawNetworkCard();
+  } else if (uiMode == MODE_INFO_BAT) {
+    drawBatteryCard();
+  } else if (uiMode == MODE_WIFI_RESET) {
+    drawWifiResetCard();
+  } else if (uiMode == MODE_ALARM_SET) {
     // Big stretched alarm time on the gradient, typographic like everything else.
     char buf[8];
     snprintf(buf, sizeof(buf), "%02d:%02d", alarmHour, alarmMinute);
@@ -555,6 +645,15 @@ void renderFrame() {
              layoutPad, layoutPad, SW - layoutPad * 2, nameH, TFT_BLACK);
     blitMask(cityMask, cityInkX, cityInkY, cityInkW, cityInkH,
              layoutPad, layoutPad + nameH + layoutGap, SW - layoutPad * 2, cityH, TFT_BLACK);
+
+    if (uiMode == MODE_STATION) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "STATION %d / %d", currentStation + 1, STATION_COUNT);
+      spr.setTextDatum(TC_DATUM);
+      spr.setFreeFont(&FreeSansBold9pt7b);
+      spr.setTextColor(TFT_BLACK);
+      spr.drawString(buf, SW / 2, 18);
+    }
   }
 
   // Corner chrome: alarm time top-left when armed, battery top-right.
@@ -611,7 +710,7 @@ void updateScreenTimeout() {
   if (screenAwake && millis() - lastActivityMs > SCREEN_TIMEOUT_MS) {
     screenAwake = false;
     g_blTarget = BACKLIGHT_OFF;
-    if (uiMode == MODE_ALARM_SET) exitAlarmMode();
+    if (uiMode != MODE_RADIO) exitToRadio();
   }
   stepBacklight();
 }
@@ -634,9 +733,6 @@ void shuffleStation() {
   retryAttempts = 0;
   requestStation(next);
 }
-
-void nextStation() { retryAttempts = 0; requestStation((currentStation + 1) % STATION_COUNT); }
-void prevStation() { retryAttempts = 0; requestStation((currentStation - 1 + STATION_COUNT) % STATION_COUNT); }
 
 uint32_t volSaveAtMs = 0;   // debounced NVS write, 2s after the last detent
 
@@ -665,7 +761,47 @@ void adjustAlarm(int detents) {
   alarmHour = total / 60;
   alarmMinute = total % 60;
   lastAlarmChange = millis();
-  alarmModeLastMs = millis();
+  uiLastInputMs = millis();
+}
+
+// ── Mode plumbing ────────────────────────────────────────
+void enterMode(UiMode m) {
+  uiMode = m;
+  ovCachedStr[0] = '\0';   // force the stretched overlay to re-render
+  uiLastInputMs = millis();
+}
+
+void exitToRadio() {
+  if (uiMode == MODE_ALARM_SET) { exitAlarmMode(); return; }   // saves to NVS
+  enterMode(MODE_RADIO);
+}
+
+void doWifiReset() {
+  Serial.println("[wifi] reset requested from menu — wiping and restarting");
+  wipeSavedNetworks();
+  WiFi.disconnect(true, true);   // also erase the core's stored credentials
+  delay(200);
+  ESP.restart();
+}
+
+void menuSelect() {
+  switch (menuIdx) {
+    case 0: enterMode(MODE_ALARM_SET); break;
+    case 1: enterMode(MODE_STATION); break;
+    case 2: enterMode(MODE_INFO_NET); break;
+    case 3: enterMode(MODE_INFO_BAT); break;
+    case 4: wifiResetYes = false; enterMode(MODE_WIFI_RESET); break;
+    default: enterMode(MODE_RADIO); break;
+  }
+}
+
+// Browsing flips the visuals instantly but only connects once the knob has
+// rested for 700ms, so spinning through the list doesn't spam connects.
+void browseStation(int detents) {
+  currentStation = ((currentStation + detents) % STATION_COUNT + STATION_COUNT) % STATION_COUNT;
+  shuffleGradient();
+  stationConnectAtMs = millis() + 700;
+  uiLastInputMs = millis();
 }
 
 void checkAlarm() {
@@ -757,6 +893,44 @@ static uint32_t encSwMs = 0, encSwPressMs = 0;
 static bool     encLongFired = false;
 #define LONG_PRESS_MS 1200
 
+// All input goes through the EC11: rotate, short press, long press.
+void onRotate(int d) {
+  switch (uiMode) {
+    case MODE_RADIO:      changeVolume(d); break;
+    case MODE_MENU:       menuIdx = ((menuIdx + d) % MENU_COUNT + MENU_COUNT) % MENU_COUNT;
+                          uiLastInputMs = millis(); break;
+    case MODE_STATION:    browseStation(d); break;
+    case MODE_ALARM_SET:  adjustAlarm(d); break;
+    case MODE_WIFI_RESET: wifiResetYes = !wifiResetYes; uiLastInputMs = millis(); break;
+    default:              uiLastInputMs = millis(); break;   // info cards ignore rotation
+  }
+}
+
+void onShortPress() {
+  switch (uiMode) {
+    case MODE_RADIO:      shuffleStation(); break;
+    case MODE_MENU:       menuSelect(); break;
+    case MODE_STATION:    enterMode(MODE_RADIO); break;
+    case MODE_ALARM_SET:
+      alarmArmed = !alarmArmed;
+      lastAlarmChange = millis();
+      uiLastInputMs = millis();
+      prefs.putBool("armed", alarmArmed);
+      break;
+    case MODE_INFO_NET:
+    case MODE_INFO_BAT:   enterMode(MODE_MENU); break;
+    case MODE_WIFI_RESET:
+      if (wifiResetYes) doWifiReset();   // does not return
+      enterMode(MODE_MENU);
+      break;
+  }
+}
+
+void onLongPress() {
+  if (uiMode == MODE_RADIO) { menuIdx = 0; enterMode(MODE_MENU); }
+  else exitToRadio();
+}
+
 void handleEncoder() {
   portENTER_CRITICAL(&encMux);
   int32_t d = encDelta;
@@ -765,10 +939,7 @@ void handleEncoder() {
   if (d != 0) {
     bool wasAwake = screenAwake;
     wakeScreen();
-    if (wasAwake) {
-      if (uiMode == MODE_ALARM_SET) adjustAlarm((int)d);
-      else changeVolume((int)d);
-    }
+    if (wasAwake) onRotate((int)d);
   }
 
   bool sw = digitalRead(PIN_ENC_SW);
@@ -780,54 +951,17 @@ void handleEncoder() {
       encSwPressMs = now;
       encLongFired = false;
     } else if (encSwPressMs && !encLongFired) {
-      // Short press on release. First press while asleep only wakes the screen.
+      // Short press fires on release. First press while asleep only wakes.
       bool wasAwake = screenAwake;
       wakeScreen();
-      if (wasAwake) {
-        if (uiMode == MODE_ALARM_SET) {
-          alarmArmed = !alarmArmed;
-          lastAlarmChange = now;
-          alarmModeLastMs = now;
-          prefs.putBool("armed", alarmArmed);
-        } else {
-          shuffleStation();
-        }
-      }
+      if (wasAwake) onShortPress();
       encSwPressMs = 0;
     }
   }
   if (sw == LOW && encSwPressMs && !encLongFired && now - encSwPressMs > LONG_PRESS_MS) {
     encLongFired = true;
     wakeScreen();
-    if (uiMode == MODE_ALARM_SET) exitAlarmMode();
-    else { uiMode = MODE_ALARM_SET; alarmModeLastMs = now; ovCachedStr[0] = '\0'; }
-  }
-}
-
-// ── Buttons ──────────────────────────────────────────────
-static bool     btnLLast = HIGH, btnRLast = HIGH;
-static uint32_t btnLMs = 0, btnRMs = 0;
-
-void handleButtons() {
-  uint32_t now = millis();
-  bool l = digitalRead(BTN_LEFT);
-  bool r = digitalRead(BTN_RIGHT);
-
-  if (l != btnLLast && now - btnLMs > 30) {
-    btnLMs = now; btnLLast = l;
-    if (l == LOW) {
-      bool wasAwake = screenAwake;
-      wakeScreen();
-      if (wasAwake) prevStation();
-    }
-  }
-  if (r != btnRLast && now - btnRMs > 30) {
-    btnRMs = now; btnRLast = r;
-    if (r == LOW) {
-      bool wasAwake = screenAwake;
-      wakeScreen();
-      if (wasAwake) nextStation();
-    }
+    onLongPress();
   }
 }
 
@@ -1002,15 +1136,15 @@ void ensureWiFi() {
   // the boot watchdog when the saved SSID isn't reachable (boot loop).
   wm.setConnectTimeout(8);
 
-  // Hold the right button (pin 14) at boot >1.2s to wipe saved creds.
+  // Hold the encoder button at boot >1.2s to wipe saved creds.
   uint32_t holdStart = millis();
   bool wipe = false;
-  while (digitalRead(BTN_RIGHT) == LOW && millis() - holdStart < 1500) {
+  while (digitalRead(PIN_ENC_SW) == LOW && millis() - holdStart < 1500) {
     if (millis() - holdStart > 1200) { wipe = true; break; }
     delay(50);
   }
   if (wipe) {
-    Serial.println("[wifi] RIGHT held at boot — wiping saved credentials");
+    Serial.println("[wifi] encoder held at boot — wiping saved credentials");
     wm.resetSettings();
     wipeSavedNetworks();
   }
@@ -1077,9 +1211,6 @@ void setup() {
 
   pinMode(PIN_POWER_ON, OUTPUT);
   digitalWrite(PIN_POWER_ON, HIGH);
-
-  pinMode(BTN_LEFT,  INPUT_PULLUP);
-  pinMode(BTN_RIGHT, INPUT_PULLUP);
 
   pinMode(PIN_ENC_A,  INPUT_PULLUP);
   pinMode(PIN_ENC_B,  INPUT_PULLUP);
@@ -1164,14 +1295,27 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  handleButtons();
   handleEncoder();
   updateScreenTimeout();
   updateFade();
   validateStream();
 
-  // Auto-exit alarm-set mode after 6s without input
-  if (uiMode == MODE_ALARM_SET && now - alarmModeLastMs > 6000) exitAlarmMode();
+  // Debounced connect after browsing stations settles
+  if (stationConnectAtMs && now >= stationConnectAtMs) {
+    stationConnectAtMs = 0;
+    retryAttempts = 0;
+    g_loading = true;
+    connectStartMs = now;
+    g_connectRequest = true;
+    Serial.printf("[station] browse -> %d/%d %s\n", currentStation + 1,
+                  STATION_COUNT, STATIONS[currentStation].name);
+  }
+
+  // Auto-exit any settings screen after a while without input
+  if (uiMode != MODE_RADIO) {
+    uint32_t timeout = (uiMode == MODE_ALARM_SET) ? 6000 : 15000;
+    if (now - uiLastInputMs > timeout) exitToRadio();
+  }
 
   if (volSaveAtMs && now >= volSaveAtMs) {
     volSaveAtMs = 0;

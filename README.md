@@ -50,15 +50,25 @@ header next to the 3V pin — the far end from the USB-C connector.
 
 ## Controls
 
-- **Rotate encoder**: volume (big stretched percentage overlay)
-- **Press encoder**: shuffle to a random station — the "take me somewhere else" button
-- **Long-press encoder (1.2s)**: alarm mode — rotate sets the time in 5-minute
-  steps, press arms/disarms, auto-exits after 6s
-- **Left button (GPIO 0)**: previous station
-- **Right button (GPIO 14)**: next station
-- **Hold right button at boot**: wipe saved WiFi credentials
+Everything runs on the EC11 — the onboard buttons sit behind the enclosure
+and are unused.
 
-Volume, station alarm time and armed state persist across reboots via NVS.
+- **Rotate**: volume (big stretched percentage overlay)
+- **Short press**: shuffle to a random station — the "take me somewhere else" button
+- **Long press (1.2s)**: settings menu (ported from globo-eink), one big
+  stretched word per item — rotate to browse, press to open, long-press to
+  go back to the radio:
+  - **ALARM** — rotate sets the wake time in 5-minute steps, press arms/disarms
+  - **STATIONS** — rotate browses the list sequentially (visuals flip
+    instantly, the stream connects 700ms after you stop turning), press returns
+  - **NETWORK** — SSID, IP, signal strength card
+  - **BATTERY** — voltage, charge, power source card
+  - **WIFI RESET** — No/Yes confirmation, then forgets all networks and restarts
+  - **BACK**
+- **Hold encoder at boot**: wipe saved WiFi credentials
+- Every settings screen times out back to the radio on its own.
+
+Volume, alarm time and armed state persist across reboots via NVS.
 
 ## Build
 
