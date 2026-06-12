@@ -220,6 +220,7 @@ uint32_t lastAlarmChange   = 0;   // 10s guard against trigger-while-adjusting
 uint32_t volOverlayUntil   = 0;   // transient volume overlay
 uint32_t lastFrame = 0, lastSecond = 0, lastHeartbeat = 0;
 unsigned long animFrame = 0;
+uint32_t g_frameCount = 0, g_renderMsAcc = 0;   // render diagnostics
 
 // Screen timeout / backlight fade (tPod)
 bool     screenAwake    = true;
@@ -300,22 +301,25 @@ void shuffleGradient() {
   transFrames = TRANS_LEN;
 }
 
-void updateBlobs() {
+// dt is in "design frames" (55ms units) so blob speed stays the same however
+// fast the renderer actually runs — at ~9fps each step just covers more
+// ground instead of the whole animation crawling at half speed.
+void updateBlobs(float dt) {
   for (int i = 0; i < NUM_BLOBS; i++) {
-    blobs[i].x += blobs[i].vx;
-    blobs[i].y += blobs[i].vy;
+    blobs[i].x += blobs[i].vx * dt;
+    blobs[i].y += blobs[i].vy * dt;
     if (blobs[i].x < -80)     blobs[i].vx =  abs(blobs[i].vx);
     if (blobs[i].x > SW + 80) blobs[i].vx = -abs(blobs[i].vx);
     if (blobs[i].y < -60)     blobs[i].vy =  abs(blobs[i].vy);
     if (blobs[i].y > SH + 60) blobs[i].vy = -abs(blobs[i].vy);
-    blobs[i].vx += (random(100) - 50) / 1500.0;
-    blobs[i].vy += (random(100) - 50) / 1500.0;
+    blobs[i].vx += dt * (random(100) - 50) / 1500.0;
+    blobs[i].vy += dt * (random(100) - 50) / 1500.0;
     blobs[i].vx = constrain(blobs[i].vx, -2.5f, 2.5f);
     blobs[i].vy = constrain(blobs[i].vy, -2.0f, 2.0f);
   }
 
   if (transFrames > 0) {
-    transFrames--;
+    transFrames -= (int)dt; if (transFrames < 0) transFrames = 0;
     float t = 1.0 - (float)transFrames / TRANS_LEN;
     t = t * (2.0 - t);
     for (int i = 0; i < NUM_BLOBS; i++) {
@@ -339,15 +343,22 @@ static inline int grain(int x, int y) {
   return (int)((h >> 25) & 0x0F) - 8;
 }
 
+// TFT_eSprite stores 16-bit pixels byte-swapped for the push; writing the
+// framebuffer directly (instead of drawPixel, which bounds-checks and swaps
+// per call) roughly halves the render time, so all hot paths do this.
+static inline uint16_t swap16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
+
 // ── Gradient rendering ───────────────────────────────────
 void renderGradient() {
+  uint16_t* fb = (uint16_t*)spr.getPointer();
   int bx[NUM_BLOBS], by[NUM_BLOBS];
   uint32_t brs[NUM_BLOBS];
 
   for (int i = 0; i < NUM_BLOBS; i++) {
     bx[i] = (int)blobs[i].x;
     by[i] = (int)blobs[i].y;
-    float breathe = 1.0f + 0.18f * sinf(animFrame * 0.06f + blobs[i].phase);
+    // Time-based so the breathing rate doesn't depend on render fps
+    float breathe = 1.0f + 0.18f * sinf(millis() * 0.0011f + blobs[i].phase);
     float r = blobs[i].baseRad * breathe;
     brs[i] = (uint32_t)(r * r);
   }
@@ -391,12 +402,12 @@ void renderGradient() {
       baseG = baseG * (256 - dark) >> 8;
       baseB = baseB * (256 - dark) >> 8;
 
-      // Write 2x2 with grain
+      // Write 2x2 with grain, straight into the framebuffer
       for (int dy = 0; dy < 2; dy++) {
+        uint16_t* row = fb + (fy + dy) * SW + fx;
         for (int dx = 0; dx < 2; dx++) {
-          int px = fx + dx, py = fy + dy;
-          int n = grain(px, py);
-          spr.drawPixel(px, py, tft.color565(
+          int n = grain(fx + dx, fy + dy);
+          row[dx] = swap16(tft.color565(
             constrain(baseR + n, 0, 255),
             constrain(baseG + n, 0, 255),
             constrain(baseB + n, 0, 255)));
@@ -430,11 +441,17 @@ void renderTextMask(const char* text, const GFXfont* font,
   mask.setTextDatum(ML_DATUM);
   mask.drawString(text, 0, sprH / 2);
 
-  uint16_t bgVal = mask.readPixel(0, 0);
+  // Stride-2 ink scan over the raw buffer (the per-call readPixel version
+  // took hundreds of ms on long 56pt names), dilated 1px afterwards to
+  // cover what the stride skipped.
+  uint16_t* mb = (uint16_t*)mask.getPointer();
+  if (!mb) { inkW = 0; return; }
+  uint16_t bgVal = mb[0];
   int minX = sprW, maxX = 0, minY = sprH, maxY = 0;
-  for (int y = 0; y < sprH; y++) {
-    for (int x = 0; x < sprW; x++) {
-      if (mask.readPixel(x, y) != bgVal) {
+  for (int y = 0; y < sprH; y += 2) {
+    const uint16_t* row = mb + y * sprW;
+    for (int x = 0; x < sprW; x += 2) {
+      if (row[x] != bgVal) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -443,33 +460,49 @@ void renderTextMask(const char* text, const GFXfont* font,
     }
   }
   if (maxX <= minX || maxY <= minY) { inkW = 0; return; }
+  minX = max(0, minX - 1); minY = max(0, minY - 1);
+  maxX = min(sprW - 1, maxX + 1); maxY = min(sprH - 1, maxY + 1);
   inkX = minX; inkY = minY;
   inkW = maxX - minX + 1;
   inkH = maxY - minY + 1;
 }
 
 // 2x2 supersampled stretch, threshold at >=2/4 for a clean edge.
+// Reads the mask and writes the framebuffer directly — readPixel/drawPixel
+// per destination pixel was the single hottest path in the whole render.
 void blitMask(TFT_eSprite &mask, int inkX, int inkY, int inkW, int inkH,
               int destX, int destY, int destW, int destH, uint16_t color) {
   if (inkW <= 0 || inkH <= 0 || destW <= 0 || destH <= 0) return;
-  uint16_t bgVal = mask.readPixel(0, 0);
+  uint16_t* mb = (uint16_t*)mask.getPointer();
+  uint16_t* fb = (uint16_t*)spr.getPointer();
+  if (!mb || !fb) return;
+  int mw = mask.width();
+  uint16_t bgVal = mb[0];
+  uint16_t col = swap16(color);
   int mxX = inkX + inkW - 1;
   int mxY = inkY + inkH - 1;
 
   for (int dy = 0; dy < destH; dy++) {
+    int py = destY + dy;
+    if (py < 0 || py >= SH) continue;
     int sY  = inkY + (int)((long)dy * inkH / destH);
     int sY1 = min(sY + 1, mxY);
+    const uint16_t* r0 = mb + sY  * mw;
+    const uint16_t* r1 = mb + sY1 * mw;
+    uint16_t* out = fb + py * SW;
     for (int dx = 0; dx < destW; dx++) {
+      int px = destX + dx;
+      if (px < 0 || px >= SW) continue;
       int sX  = inkX + (int)((long)dx * inkW / destW);
       int sX1 = min(sX + 1, mxX);
 
       int c = 0;
-      if (mask.readPixel(sX,  sY)  != bgVal) c++;
-      if (mask.readPixel(sX1, sY)  != bgVal) c++;
-      if (mask.readPixel(sX,  sY1) != bgVal) c++;
-      if (mask.readPixel(sX1, sY1) != bgVal) c++;
+      if (r0[sX]  != bgVal) c++;
+      if (r0[sX1] != bgVal) c++;
+      if (r1[sX]  != bgVal) c++;
+      if (r1[sX1] != bgVal) c++;
 
-      if (c >= 2) spr.drawPixel(destX + dx, destY + dy, color);
+      if (c >= 2) out[px] = col;
     }
   }
 }
@@ -524,14 +557,15 @@ void drawBatteryIcon(int x, int y, int pct) {
 static float loadVis = 0.0f;
 
 static inline void edgeBrighten(int x, int y, float a) {
-  uint16_t c = spr.readPixel(x, y);
+  uint16_t* fb = (uint16_t*)spr.getPointer();
+  uint16_t c = swap16(fb[y * SW + x]);
   int r = ((c >> 11) & 0x1F) << 3;
   int g = ((c >>  5) & 0x3F) << 2;
   int b = ( c        & 0x1F) << 3;
   r += (int)((255 - r) * a);
   g += (int)((255 - g) * a);
   b += (int)((255 - b) * a);
-  spr.drawPixel(x, y, spr.color565(r, g, b));
+  fb[y * SW + x] = swap16(spr.color565(r, g, b));
 }
 
 void drawLoadingEdge() {
@@ -539,7 +573,7 @@ void drawLoadingEdge() {
   if (loadVis < 0.03f) return;
 
   const int per   = 2 * (SW + SH);   // perimeter in px
-  const int tail  = 200;             // comet tail length
+  const int tail  = 260;             // comet tail length (long: reads smooth at ~9fps)
   const int depth = 3;               // how far the glow bleeds inward
   // 0.7 px/ms -> one lap in ~1.4s, integer math so it never drifts
   int head = (int)((millis() * 7UL / 10UL) % (uint32_t)per);
@@ -624,9 +658,15 @@ void drawWifiResetCard() {
   }
 }
 
+// Per-stage render profiling, printed with the [ui] heartbeat line
+uint32_t g_gradMs = 0, g_textMs = 0, g_pushMs = 0;
+
 // ── Main render ──────────────────────────────────────────
 void renderFrame() {
+  uint32_t t0 = millis();
   renderGradient();
+  g_gradMs += millis() - t0;
+  t0 = millis();
 
   if (uiMode == MODE_MENU) {
     // Settings the globo way: one big stretched word per item, spin to browse.
@@ -703,8 +743,11 @@ void renderFrame() {
   if (g_batPct >= 0 && g_batPct <= 25) drawBatteryIcon(SW - 28, 5, g_batPct);
 
   drawLoadingEdge();   // handles its own fade in/out, safe to call always
+  g_textMs += millis() - t0;
 
+  t0 = millis();
   spr.pushSprite(0, 0);
+  g_pushMs += millis() - t0;
 }
 
 // ── Battery ──────────────────────────────────────────────
@@ -732,7 +775,7 @@ void stepBacklight() {
   if (step < 1) step = 1;
   if (goingUp) g_blCurrent = min(g_blCurrent + step, g_blTarget);
   else         g_blCurrent = max(g_blCurrent - step, g_blTarget);
-  analogWrite(PIN_BACKLIGHT, (uint8_t)g_blCurrent);
+  ledcWrite(PIN_BACKLIGHT, (uint32_t)g_blCurrent);
 }
 
 void wakeScreen() {
@@ -747,7 +790,7 @@ void updateScreenTimeout() {
     g_blTarget = BACKLIGHT_OFF;
     if (uiMode != MODE_RADIO) exitToRadio();
   }
-  stepBacklight();
+  // Backlight stepping happens in the UI task, which never freezes.
 }
 
 // ── Stations / volume ────────────────────────────────────
@@ -911,7 +954,10 @@ static const int8_t QENC_TABLE[16] = {
    0, +1, -1,  0,
 };
 
+static volatile uint32_t encIsrCount = 0;   // diagnostics: ISR storm detector
+
 static void IRAM_ATTR encISR() {
+  encIsrCount++;
   uint8_t newState = (digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B);
   int8_t step = QENC_TABLE[(encState << 2) | newState];
   encState = newState;
@@ -997,6 +1043,35 @@ void handleEncoder() {
     encLongFired = true;
     wakeScreen();
     onLongPress();
+  }
+}
+
+// ── UI task (core 0) ─────────────────────────────────────
+// Rendering lives on core 0 so it can never be starved by the audio task:
+// connecttohost() (TLS handshake included) blocks the priority-5 audio task
+// on core 1 for seconds, which froze the whole UI exactly when the loading
+// animation mattered. WiFi tasks on core 0 preempt briefly but only cost
+// the odd frame. Only this task touches tft/spr/masks after setup().
+void uiTask(void*) {
+  Serial.println("[uiTask] started");
+  for (;;) {
+    stepBacklight();
+    bool visible = screenAwake || g_blCurrent > 0;
+    if (visible) {
+      uint32_t t0 = millis();
+      static uint32_t lastBlobMs = 0;
+      float blobDt = lastBlobMs ? (t0 - lastBlobMs) / 55.0f : 1.0f;
+      lastBlobMs = t0;
+      animFrame++;
+      updateBlobs(constrain(blobDt, 0.5f, 4.0f));
+      renderFrame();
+      uint32_t dt = millis() - t0;
+      g_renderMsAcc += dt;
+      g_frameCount++;
+      vTaskDelay(pdMS_TO_TICKS(dt >= 55 ? 5 : 55 - dt));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
   }
 }
 
@@ -1259,12 +1334,12 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
 
   // Backlight PWM MUST be set up after tft.init() — TFT_eSPI's init does its
-  // own pinMode+digitalWrite on TFT_BL which would detach the LEDC channel.
-  // Full brightness immediately: ensureWiFi() can block for many seconds and
-  // the fade in stepBacklight() only runs from loop().
-  analogWriteResolution(PIN_BACKLIGHT, 8);
-  analogWriteFrequency(PIN_BACKLIGHT, 2000);
-  analogWrite(PIN_BACKLIGHT, BACKLIGHT_BRIGHT);
+  // own pinMode+digitalWrite on TFT_BL which would clobber the LEDC channel.
+  // Explicit ledcAttach/ledcWrite (not analogWrite) so the channel is
+  // definitely bound to the pin; full brightness immediately because
+  // ensureWiFi() can block for many seconds before the UI task starts.
+  ledcAttach(PIN_BACKLIGHT, 2000, 8);
+  ledcWrite(PIN_BACKLIGHT, BACKLIGHT_BRIGHT);
   g_blCurrent = BACKLIGHT_BRIGHT;
   g_blTarget  = BACKLIGHT_BRIGHT;
   g_blLastMs  = millis();
@@ -1322,8 +1397,10 @@ void setup() {
                 currentStation + 1, STATION_COUNT, STATIONS[currentStation].name);
 
   // Audio on core 1 at priority 5 — away from the WiFi stack on core 0, and
-  // above the Arduino loop so TLS work can't starve the decoder.
+  // above the Arduino loop so TLS work can't starve the decoder. Rendering
+  // on core 0 so the audio task can't starve the UI (see uiTask).
   xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 5, NULL, 1);
+  xTaskCreatePinnedToCore(uiTask,    "ui",    8192, NULL, 1, NULL, 0);
 }
 
 // ── Main loop ────────────────────────────────────────────
@@ -1369,15 +1446,19 @@ void loop() {
                   (unsigned)audioTaskTicks, (int)audio.isRunning(),
                   (unsigned)audio.getBitRate(), (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getFreePsram());
+    uint32_t fc = g_frameCount ? g_frameCount : 1;
+    Serial.printf("[ui] fps=%.1f avgRender=%ums (grad=%u text=%u push=%u) awake=%d bl=%d mode=%d encIsr=%u loading=%d\n",
+                  g_frameCount / 3.0f,
+                  g_frameCount ? (unsigned)(g_renderMsAcc / g_frameCount) : 0,
+                  (unsigned)(g_gradMs / fc), (unsigned)(g_textMs / fc),
+                  (unsigned)(g_pushMs / fc),
+                  (int)screenAwake, g_blCurrent, (int)uiMode,
+                  (unsigned)encIsrCount, (int)g_loading);
+    g_frameCount = 0;
+    g_renderMsAcc = 0;
+    g_gradMs = g_textMs = g_pushMs = 0;
+    encIsrCount = 0;
   }
 
-  // Skip rendering entirely while the screen is dark — renderGradient is the
-  // hottest loop in the sketch and nobody is watching.
-  bool screenVisible = screenAwake || g_blCurrent > 0;
-  if (screenVisible && now - lastFrame >= 55) {
-    lastFrame = now;
-    animFrame++;
-    updateBlobs();
-    renderFrame();
-  }
+  // Rendering happens in uiTask on core 0 — nothing to do here.
 }
