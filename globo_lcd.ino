@@ -516,16 +516,51 @@ void drawBatteryIcon(int x, int y, int pct) {
   if (fillW > 0) spr.fillRect(x + 2, y + 2, fillW, h - 4, col);
 }
 
-// 8-dot rotating spinner (tPod), shown bottom-right while buffering.
-void drawSpinner(int cx, int cy, int r) {
-  int phase = (int)(millis() / 90);
-  for (int i = 0; i < 8; i++) {
-    float a = ((float)i / 8) * 2.0f * (float)M_PI - (float)M_PI_2;
-    int px = cx + (int)(cosf(a) * r);
-    int py = cy + (int)(sinf(a) * r);
-    int d  = ((i - phase) % 8 + 8) % 8;
-    int br = 235 - (7 - d) * 30;
-    spr.fillCircle(px, py, 2, spr.color565(br, br, br));
+// ── Loading edge glow ────────────────────────────────────
+// "Something is happening" the console way: while a stream is tuning, a
+// luminous comet sweeps around the screen border, additively brightening
+// the gradient underneath — no chrome, works on every palette. Intensity
+// eases in and out so it never pops; it just dissolves when audio is live.
+static float loadVis = 0.0f;
+
+static inline void edgeBrighten(int x, int y, float a) {
+  uint16_t c = spr.readPixel(x, y);
+  int r = ((c >> 11) & 0x1F) << 3;
+  int g = ((c >>  5) & 0x3F) << 2;
+  int b = ( c        & 0x1F) << 3;
+  r += (int)((255 - r) * a);
+  g += (int)((255 - g) * a);
+  b += (int)((255 - b) * a);
+  spr.drawPixel(x, y, spr.color565(r, g, b));
+}
+
+void drawLoadingEdge() {
+  loadVis += ((g_loading ? 1.0f : 0.0f) - loadVis) * 0.15f;
+  if (loadVis < 0.03f) return;
+
+  const int per   = 2 * (SW + SH);   // perimeter in px
+  const int tail  = 200;             // comet tail length
+  const int depth = 3;               // how far the glow bleeds inward
+  // 0.7 px/ms -> one lap in ~1.4s, integer math so it never drifts
+  int head = (int)((millis() * 7UL / 10UL) % (uint32_t)per);
+
+  for (int i = 0; i < tail; i++) {
+    int p = head - i;
+    if (p < 0) p += per;
+    float t = 1.0f - (float)i / tail;
+    float a = t * t * loadVis;       // quadratic falloff toward the tail
+
+    // Map perimeter position to (x, y) plus the inward direction, clockwise
+    // from the top-left corner.
+    int x, y, dx, dy;
+    if (p < SW)               { x = p;                     y = 0;                      dx = 0;  dy = 1; }
+    else if (p < SW + SH)     { x = SW - 1;                y = p - SW;                 dx = -1; dy = 0; }
+    else if (p < 2 * SW + SH) { x = SW - 1 - (p - SW - SH); y = SH - 1;                dx = 0;  dy = -1; }
+    else                      { x = 0;                     y = SH - 1 - (p - 2 * SW - SH); dx = 1; dy = 0; }
+
+    for (int d = 0; d < depth; d++) {
+      edgeBrighten(x + dx * d, y + dy * d, a * (1.0f - (float)d / depth));
+    }
   }
 }
 
@@ -667,7 +702,7 @@ void renderFrame() {
   }
   if (g_batPct >= 0 && g_batPct <= 25) drawBatteryIcon(SW - 28, 5, g_batPct);
 
-  if (g_loading) drawSpinner(SW - 22, SH - 22, 12);
+  drawLoadingEdge();   // handles its own fade in/out, safe to call always
 
   spr.pushSprite(0, 0);
 }
