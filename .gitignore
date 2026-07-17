@@ -5,3 +5,6 @@ build/
 *.map
 .vscode/
 .DS_Store
+# BBC RemArc audio: personal/edu licence — never push to the public repo
+soundscapes/raw/
+soundscapes/out/
