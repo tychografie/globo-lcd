@@ -1688,26 +1688,41 @@ void renderFrame() {
 // physics, not fixable without a gauge chip.
 void updateBattery() {
   int pinMv = analogReadMilliVolts(PIN_BAT_ADC);
-  int vbatMv = pinMv * 2;   // undo the 100k/100k divider
-  if (g_batMvEma == 0.0f) g_batMvEma = (float)vbatMv;
-  else g_batMvEma = 0.8f * g_batMvEma + 0.2f * (float)vbatMv;
+  int raw = pinMv * 2;   // undo the 100k/100k divider
+  // USB just unplugged: the EMA is parked at the 4.86V rail. Snap straight
+  // to the cell instead of decaying through the whole curve — the decay
+  // briefly read as a "100%..50% battery" and poisoned the learning.
+  if (g_batMvEma >= 4500.0f && raw < 4400) g_batMvEma = (float)raw;
+  if (g_batMvEma == 0.0f) g_batMvEma = (float)raw;
+  // Slow EMA (~20s time constant at 1Hz): WiFi TX bursts sag the cell tens
+  // of mV every second, and the curve's steep middle turned that into a
+  // 41..48% ping-pong (Tycho). The battery itself changes over hours.
+  else g_batMvEma = 0.95f * g_batMvEma + 0.05f * (float)raw;
   int mv = (int)g_batMvEma;
   if (mv >= 4500) { g_batPct = -1; return; }   // USB rail — the cell is invisible
   static const int   CURVE_MV[]  = {3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200};
   static const int   CURVE_PCT[] = {   0,    5,   10,   18,   30,   45,   60,   78,   90,  100};
   static const int   CURVE_N = 10;
-  if (mv <= CURVE_MV[0]) g_batPct = 0;
-  else if (mv >= CURVE_MV[CURVE_N - 1]) g_batPct = 100;
-  else for (int i = 1; i < CURVE_N; i++) {
-    if (mv < CURVE_MV[i]) {
-      g_batPct = CURVE_PCT[i - 1] + (CURVE_PCT[i] - CURVE_PCT[i - 1]) *
-                 (mv - CURVE_MV[i - 1]) / (CURVE_MV[i] - CURVE_MV[i - 1]);
-      break;
+  int pct;
+  if (mv <= CURVE_MV[0]) pct = 0;
+  else if (mv >= CURVE_MV[CURVE_N - 1]) pct = 100;
+  else { pct = 0;
+    for (int i = 1; i < CURVE_N; i++) {
+      if (mv < CURVE_MV[i]) {
+        pct = CURVE_PCT[i - 1] + (CURVE_PCT[i] - CURVE_PCT[i - 1]) *
+              (mv - CURVE_MV[i - 1]) / (CURVE_MV[i] - CURVE_MV[i - 1]);
+        break;
+      }
     }
   }
+  // ±1% display hysteresis on top of the slow EMA: the number only moves
+  // when the estimate really moved.
+  if (g_batPct < 0 || abs(pct - g_batPct) >= 2) g_batPct = pct;
   // A live cell reading is worth remembering — it's all we'll have to show
-  // the next time USB hides the battery. NVS writes throttled to ≥3% steps.
-  if (mv > 2500) {
+  // the next time USB hides the battery. Learn only when BOTH the instant
+  // and averaged reading sit in cell range (never during plug/unplug
+  // transients). NVS writes throttled to ≥3% steps.
+  if (mv > 2500 && mv < 4400 && raw > 2500 && raw < 4400) {
     if (!g_hasBattery) { g_hasBattery = true; prefs.putBool("hasBat", true); }
     if (g_lastBatPct < 0 || abs(g_batPct - g_lastBatPct) >= 3) {
       g_lastBatPct = g_batPct;
@@ -3039,6 +3054,9 @@ void handleApiStatus() {
   j += ",\"remainMin\":"; j += sleepRemain;
   j += "},\"battery\":{\"pct\":"; j += shownBatPct();
   j += ",\"usb\":"; j += usb ? "true" : "false";
+  j += ",\"mv\":"; j += (int)g_batMvEma;          // diagnosis: raw rail/cell EMA
+  j += ",\"hasBat\":"; j += g_hasBattery ? "true" : "false";
+  j += ",\"lastPct\":"; j += g_lastBatPct;
   j += "},\"rssi\":"; j += WiFi.RSSI();
   j += "}";
   webSendJson(j);
