@@ -22,7 +22,9 @@ streaming engine). Full comparison and merge notes in [INVENTORY.md](INVENTORY.m
   horizontally to fill the screen — a fake variable-width axis.
 - **WiFi onboarding**: no credentials in code. First boot opens a captive
   portal with a join-QR on screen; every network you ever join is remembered
-  in NVS and tried strongest-first on boot.
+  in NVS and tried strongest-first on boot. When offline, a background
+  watcher keeps scanning and joins a remembered network the moment it
+  appears — made for the phone-hotspot dance while travelling.
 - **iPod-style power UX**: 30s screen timeout with soft backlight fade;
   rendering pauses entirely while the screen is dark.
 
@@ -61,7 +63,9 @@ and are unused.
   - **ALARM** — rotate sets the wake time in 5-minute steps, press arms/disarms
   - **STATIONS** — rotate browses the list sequentially (visuals flip
     instantly, the stream connects 700ms after you stop turning), press returns
-  - **NETWORK** — SSID, IP, signal strength card
+  - **NETWORK** — connected: QR + address of the web remote; offline: live
+    search status (searching / joining / countdown to the next scan), click
+    searches immediately, long-press goes back
   - **BATTERY** — voltage, charge, power source card
   - **WIFI RESET** — No/Yes confirmation, then forgets all networks and restarts
   - **BACK**
@@ -69,6 +73,30 @@ and are unused.
 - Every settings screen times out back to the radio on its own.
 
 Volume, alarm time and armed state persist across reboots via NVS.
+
+## On the road (phone hotspot)
+
+Globo re-joins remembered networks **whenever they appear**, not just at
+boot — so the order of operations no longer matters:
+
+1. Power up Globo. If the hotspot isn't broadcasting yet it simply boots
+   offline.
+2. Turn on the phone's hotspot and stay on the hotspot settings screen —
+   phone hotspots only broadcast while that screen is open or a device is
+   already attached.
+3. Within ~15 s Globo finds it, joins, and the radio resumes on its own.
+
+The first time on a new hotspot the setup portal appears. Hotspot quirks
+the flow accounts for:
+
+- **iPhone**: enable **Maximize Compatibility** — Globo is 2.4 GHz-only and
+  never sees a 5 GHz-only hotspot.
+- Typed credentials are kept even when that first join fails. (Your phone
+  being parked on the Globo-Setup portal pauses its own hotspot, so the
+  first attempt tends to fail through no fault of yours.) The moment the
+  phone lets go and the hotspot resumes, Globo connects by itself.
+- The **NETWORK** menu screen shows what the watcher is doing in real time;
+  click to search immediately instead of waiting for the next pass.
 
 ## Build
 

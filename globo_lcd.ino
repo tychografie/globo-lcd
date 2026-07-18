@@ -188,6 +188,37 @@ uint32_t sleepFadeStartMs = 0;
 // (or after a wipe) brings up an open AP with a join-QR on screen.
 const char* WIFI_AP_NAME = "Globo-Setup";
 
+// Runtime WiFi watcher — the travel fix. Boot-time ensureWiFi() is a one-shot,
+// but on the road the network appears AFTER boot: a phone hotspot only
+// broadcasts while its settings screen is open (or a client is attached), so
+// "power up Globo, then fumble the hotspot on" used to mean permanent offline
+// until a restart. The watcher runs from loop(): whenever the link is down it
+// rescans for remembered networks every WW_SCAN_EVERY_MS and joins the
+// strongest one that shows up — flip the hotspot on and Globo walks in by
+// itself, no reboot, no portal. States: ONLINE (link up, idle) → WAIT
+// (countdown to next scan) → SCANNING (async scan in flight) → JOINING
+// (WiFi.begin issued, waiting on the handshake) → back to WAIT or ONLINE.
+enum WifiWatch { WW_ONLINE, WW_WAIT, WW_SCANNING, WW_JOINING };
+static WifiWatch wwState = WW_ONLINE;
+static uint32_t  wwNextMs = 0;          // WW_WAIT: when the next scan fires
+static uint32_t  wwJoinT0 = 0;          // WW_JOINING: when the attempt started
+static String    wwSsid;                // network the current attempt targets
+static char      wwLastResult[48] = ""; // last outcome, for the NETWORK card
+static int       g_savedNetCount = 0;   // cached — NVS is too slow per frame
+#define WW_SCAN_EVERY_MS   12000
+#define WW_JOIN_TIMEOUT_MS 12000
+#define WW_DROP_GRACE_MS    8000  // core autoReconnect gets first shot at a drop
+
+// Services that normally start in setup() right after a successful connect.
+// When the first connect happens mid-session (watcher), they start then.
+static bool g_webUp = false, g_ntpUp = false;
+
+// Explicit prototypes: the .ino auto-prototype misses these (each is used
+// before its definition — the retry hook in onShortPress, the web bring-up
+// in the watcher's onWifiRegained).
+void wifiWatcherRetryNow();
+void webSetup();
+
 // ── Time ─────────────────────────────────────────────────
 const char* TZ_INFO    = "CET-1CEST,M3.5.0,M10.5.0/3";  // Europe/Amsterdam
 const char* NTP_SERVER = "pool.ntp.org";
@@ -414,8 +445,10 @@ const char* menuLabel(int idx) {
     else            snprintf(buf, sizeof(buf), "Alarm off");
     return buf;
   }
-  if (idx == MI_NETWORK)   // the address *is* the label — it's a door
-    return WiFi.status() == WL_CONNECTED ? "globo.local" : "Offline";
+  if (idx == MI_NETWORK) {  // the address *is* the label — it's a door
+    if (WiFi.status() == WL_CONNECTED) return "globo.local";
+    return (wwState == WW_SCANNING || wwState == WW_JOINING) ? "Searching" : "Offline";
+  }
   if (idx == MI_BATTERY && batteryPresent()) {
     static char bat[16];
     snprintf(bat, sizeof(bat), "Battery %d%%", g_batPct);
@@ -1164,7 +1197,38 @@ bool g_netShowIp = false;
 
 void drawNetworkCard() {
   if (WiFi.status() != WL_CONNECTED) {
-    drawInfoScreen("NETWORK", "Offline", "WiFi reset + restart", "to set up a network");
+    // Live watcher status, not a shrug. The card animates through the search
+    // cycle (searching → joining → countdown to the next pass) so on the road
+    // you can SEE the device looking for your hotspot — and click to skip the
+    // wait. Only the no-networks-saved case still points at WiFi reset.
+    static const char* dots[4] = {"", ".", "..", "..."};
+    String l1, l2;
+    if (wwState == WW_SCANNING) {
+      l1 = String("searching") + dots[(millis() / 350) % 4];
+      l2 = String(g_savedNetCount) + " remembered network" + (g_savedNetCount == 1 ? "" : "s");
+    } else if (wwState == WW_JOINING) {
+      l1 = "joining " + wwSsid + dots[(millis() / 350) % 4];
+      l2 = "";
+    } else if (g_savedNetCount <= 0) {
+      l1 = "no networks saved";
+      l2 = "WiFi reset sets one up";
+    } else {
+      l1 = wwLastResult[0] ? wwLastResult : "offline";
+      int32_t waitMs = (int32_t)(wwNextMs - millis());
+      l2 = (wwState == WW_WAIT && waitMs > 0)
+             ? "next search in " + String((waitMs + 999) / 1000) + "s"
+             : String(g_savedNetCount) + " remembered network" + (g_savedNetCount == 1 ? "" : "s");
+    }
+    spr.setTextDatum(TC_DATUM);
+    spr.setTextColor(g_inkPri);
+    spr.setFreeFont(uiFontRow());
+    spr.drawString("NETWORK", SW / 2, 20);
+    spr.setFreeFont(uiFontBody());
+    spr.drawString(l1, SW / 2, 62);
+    spr.drawString(l2, SW / 2, 88);
+    drawTextAlpha(g_savedNetCount > 0 ? "click: search now   hold: back"
+                                      : "click: back",
+                  uiFontBody(), 148, 150, g_inkDim);
     return;
   }
   String url = g_netShowIp ? "http://" + WiFi.localIP().toString()
@@ -1938,6 +2002,14 @@ void onShortPress() {
       enterMode(MODE_MENU);
       break;
     case MODE_INFO_NET:
+      // Offline with networks on file: the click is a "search now" button —
+      // skip the countdown and rescan immediately. Back is a long press.
+      if (WiFi.status() != WL_CONNECTED && g_savedNetCount > 0) {
+        wifiWatcherRetryNow();
+        uiLastInputMs = millis();
+        break;
+      }
+      enterMode(MODE_MENU); break;
     case MODE_INFO_BAT:   enterMode(MODE_MENU); break;
     case MODE_WIFI_RESET:
       if (wifiResetYes) doWifiReset();   // does not return
@@ -2316,6 +2388,7 @@ std::vector<WifiCred> loadSavedNetworks() {
     if (ssid.length()) out.push_back({ssid, psk});
   }
   wifiPrefs.end();
+  g_savedNetCount = (int)out.size();   // keep the UI's cached count honest
   return out;
 }
 
@@ -2343,6 +2416,7 @@ void rememberNetwork(const String& ssid, const String& psk) {
   wifiPrefs.putString(wifiPskKey(idx).c_str(),  psk);
   wifiPrefs.putInt(WIFI_KEY_COUNT, (int)creds.size());
   wifiPrefs.end();
+  g_savedNetCount = (int)creds.size();
   Serial.printf("[wifi] remembered SSID='%s' (total=%u)\n",
                 ssid.c_str(), (unsigned)creds.size());
 }
@@ -2351,6 +2425,7 @@ void wipeSavedNetworks() {
   wifiPrefs.begin(WIFI_NS, false);
   wifiPrefs.clear();
   wifiPrefs.end();
+  g_savedNetCount = 0;
   Serial.println("[wifi] cleared saved networks store");
 }
 
@@ -2507,6 +2582,18 @@ void ensureWiFi() {
   wm.setConnectTimeout(8);
   wm.setTitle("GLOBO");
   wm.setCustomHeadElement(PORTAL_HEAD);
+  // Keep the typed credentials even when the first join fails. The hotspot
+  // trap: while the phone is parked on the Globo-Setup AP filling in this
+  // portal, its OWN hotspot pauses broadcasting — so the join attempt is
+  // doomed by the very act of configuring it. With breakAfterConfig the
+  // portal closes after save regardless; we remember the creds below and
+  // connect the moment the phone lets go and the hotspot comes back.
+  wm.setBreakAfterConfig(true);
+  static WiFiManagerParameter hotspotHint(
+    "<div class='msg'>Using a phone hotspot? Keep the hotspot settings screen "
+    "open on the phone until Globo is connected. iPhone: turn on "
+    "<b>Maximize Compatibility</b> &mdash; Globo speaks 2.4&thinsp;GHz only.</div>");
+  wm.addParameter(&hotspotHint);
 
   // Hold the encoder button at boot >1.2s to wipe saved creds.
   uint32_t holdStart = millis();
@@ -2560,6 +2647,14 @@ void ensureWiFi() {
   }
 
   // Fall back to the captive portal + QR code on screen.
+  // Portal window: the full 5 minutes on a virgin device, but only 90s once
+  // networks are remembered — on the road the portal usually opens just
+  // because the hotspot wasn't broadcasting YET, and the sooner it closes,
+  // the sooner the watcher starts scanning for it. A phone attached to the
+  // AP always holds the portal open (setAPClientCheck), so nobody gets cut
+  // off mid-password.
+  wm.setConfigPortalTimeout(saved.empty() ? 300 : 90);
+  wm.setAPClientCheck(true);
   wm.setAPCallback([](WiFiManager* m){
     Serial.printf("[wifi] config portal up: SSID=%s IP=%s\n",
                   WIFI_AP_NAME, WiFi.softAPIP().toString().c_str());
@@ -2568,15 +2663,143 @@ void ensureWiFi() {
 
   Serial.println("[wifi] autoConnect()...");
   bool ok = wm.autoConnect(WIFI_AP_NAME, nullptr);
-  if (ok) {
+  if (!ok) {
+    // Portal closed without a live link — but if credentials WERE typed
+    // (breakAfterConfig), the join probably failed only because the phone was
+    // still holding the portal open (see above). The AP is down now, the
+    // phone has let go, the hotspot is waking back up: remember the creds
+    // and give the join a couple of clean STA-mode tries.
+    String ssid = wm.getWiFiSSID(true), psk = wm.getWiFiPass(true);
+    if (ssid.length()) {
+      // Only burn retry time on credentials that are actually NEW — a portal
+      // that merely timed out hands back whatever the core already had
+      // stored, and the scan above already ruled those networks out.
+      bool fresh = true;
+      for (auto& c : loadSavedNetworks())
+        if (c.ssid == ssid && c.psk == psk) { fresh = false; break; }
+      rememberNetwork(ssid, psk);
+      if (fresh) {
+        WiFi.mode(WIFI_STA);
+        for (int i = 0; i < 3 && WiFi.status() != WL_CONNECTED; i++)
+          tryConnect(ssid, psk, 10000);
+      }
+    }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[wifi] connected, ip=%s rssi=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
     rememberNetwork(WiFi.SSID(), WiFi.psk());
   } else {
-    // Offline mode: no reboot loop. Visuals and menu run; the radio politely
-    // reports "no WiFi" and stays idle instead of spinning forever.
-    Serial.println("[wifi] no connection — continuing offline (demo mode)");
-    WiFi.mode(WIFI_OFF);
+    // Offline is a state, not a verdict: visuals and menu run, the radio
+    // politely reports "no WiFi" — and the watcher keeps scanning, so the
+    // moment a remembered network (a hotspot, say) shows up, Globo joins it
+    // without a reboot. WiFi therefore stays in STA, not OFF.
+    Serial.println("[wifi] no connection — offline, watcher armed");
+    WiFi.mode(WIFI_STA);
+    wwState = WW_WAIT;
+    wwNextMs = millis() + 5000;
+  }
+}
+
+// ── Runtime WiFi watcher (see the state block up top) ────
+// Serviced every loop() pass; all waiting is non-blocking so the UI, encoder
+// and web remote never notice a scan in flight.
+void wifiWatcherRetryNow() {           // the NETWORK card's click-to-search
+  if (wwState == WW_WAIT) wwNextMs = millis();
+}
+
+// First successful link of the session may happen here rather than in setup():
+// bring up whatever a boot-time connect would have brought up, then resume the
+// stream on the SAME station — a reconnect is recovery, not a new identity.
+static void onWifiRegained() {
+  Serial.printf("[wifi] online: '%s' ip=%s rssi=%d\n", WiFi.SSID().c_str(),
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  wwState = WW_ONLINE;
+  wwLastResult[0] = '\0';
+  rememberNetwork(WiFi.SSID(), WiFi.psk());
+  WiFi.setSleep(WIFI_PS_NONE);         // streaming hates modem-sleep (setup())
+  if (!g_ntpUp) { configTzTime(TZ_INFO, NTP_SERVER); g_ntpUp = true; }
+  if (!g_webUp) {
+    webSetup();
+    g_webUp = true;
+    WiFi.setSleep(WIFI_PS_NONE);       // mDNS init can re-enable PS
+  }
+  // The radio went idle when the link died (validateStream's "no WiFi"
+  // branch). If it should be playing, pick the stream back up. A stream
+  // that's still nominally running recovers on its own via the EOF handler
+  // or the lag watchdog, so only the idle case needs a push here.
+  if (!radioOff && !alarmSilenced && !alarmFadeOut && volumeLevel > 0 &&
+      !audio.isRunning() && !g_loading) {
+    Serial.println("[wifi] resuming the stream");
+    retryAttempts = 0;
+    g_loading = true;
+    connectStartMs = millis();
+    g_connectRequest = true;
+  }
+}
+
+void serviceWifiWatcher() {
+  uint32_t now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wwState != WW_ONLINE) onWifiRegained();
+    return;
+  }
+  switch (wwState) {
+    case WW_ONLINE:   // the link just dropped
+      Serial.println("[wifi] connection lost — watcher armed");
+      snprintf(wwLastResult, sizeof(wwLastResult), "connection lost");
+      wwState = WW_WAIT;
+      wwNextMs = now + WW_DROP_GRACE_MS;
+      break;
+    case WW_WAIT:
+      if ((int32_t)(now - wwNextMs) < 0) break;
+      if (g_savedNetCount <= 0) { wwNextMs = now + WW_SCAN_EVERY_MS; break; }
+      // Same fast async scan as boot. disconnect() first: the core may still
+      // be quietly re-associating, and a scan under that fails or lies.
+      WiFi.disconnect(false, false);
+      WiFi.scanNetworks(true, false, false, 150);
+      wwState = WW_SCANNING;
+      break;
+    case WW_SCANNING: {
+      int found = WiFi.scanComplete();
+      if (found == WIFI_SCAN_RUNNING) break;
+      String bestSsid, bestPsk;
+      int32_t bestRssi = INT32_MIN;
+      if (found > 0) {
+        auto saved = loadSavedNetworks();
+        for (auto& c : saved)
+          for (int j = 0; j < found; j++)
+            if (WiFi.SSID(j) == c.ssid && WiFi.RSSI(j) > bestRssi) {
+              bestRssi = WiFi.RSSI(j);
+              bestSsid = c.ssid;
+              bestPsk  = c.psk;
+            }
+      }
+      WiFi.scanDelete();
+      if (bestSsid.length()) {
+        Serial.printf("[wifi] watcher: '%s' in range (%ddBm) — joining\n",
+                      bestSsid.c_str(), (int)bestRssi);
+        WiFi.begin(bestSsid.c_str(), bestPsk.c_str());
+        wwSsid   = bestSsid;
+        wwJoinT0 = now;
+        wwState  = WW_JOINING;
+      } else {
+        snprintf(wwLastResult, sizeof(wwLastResult), "no known network nearby");
+        wwState  = WW_WAIT;
+        wwNextMs = now + WW_SCAN_EVERY_MS;
+      }
+      break;
+    }
+    case WW_JOINING:
+      if (now - wwJoinT0 < WW_JOIN_TIMEOUT_MS) break;
+      Serial.printf("[wifi] watcher: joining '%s' timed out\n", wwSsid.c_str());
+      snprintf(wwLastResult, sizeof(wwLastResult), "couldn't join %s", wwSsid.c_str());
+      WiFi.disconnect(false, false);
+      wwState  = WW_WAIT;
+      // Retry sooner than a full period — hotspots often accept on the second
+      // knock (the first one only woke them up).
+      wwNextMs = now + WW_SCAN_EVERY_MS / 2;
+      break;
   }
 }
 
@@ -2992,9 +3215,12 @@ void setup() {
   bool online = WiFi.status() == WL_CONNECTED;
   if (online) {
     configTzTime(TZ_INFO, NTP_SERVER);
+    g_ntpUp = true;
     webSetup();   // http://globo.local — web remote + JSON API
+    g_webUp = true;
     WiFi.setSleep(WIFI_PS_NONE);   // re-assert: mDNS/service init can re-enable PS
   }
+  // (offline: ensureWiFi armed the watcher; NTP/web start on first connect)
 
   // I2S to the MAX98357 (a single mono speaker). forceMono sums L+R so nothing
   // panned hard to one side is lost. Tone is a selectable 3-band EQ tuned for
@@ -3045,6 +3271,7 @@ void loop() {
   updateScreenTimeout();
   updateFade();
   validateStream();
+  serviceWifiWatcher();   // travel: rejoin remembered networks as they appear
 
   // Sleep timer: at T-0 begin a 15s fade, then stop the stream and restore
   // the volume so the next play (knob or alarm) starts at the set level.
