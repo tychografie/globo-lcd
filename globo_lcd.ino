@@ -1190,7 +1190,10 @@ void drawLoadingEdge() {
 // ── Info cards (settings screens ported from globo-eink) ─
 // A LiPo reads a plausible cell voltage; on USB with no cell the VBAT pin sits
 // well above the LiPo ceiling (~4.8V), so hide the Battery item then.
-bool batteryPresent() { return g_batMvEma > 2500.0f && g_batMvEma < 4400.0f; }
+// The ceiling is 4550, NOT 4400: a cell that is CHARGING clamps the rail to
+// ~4.35-4.45V, and the old 4400 cutoff made a charging battery read as "no
+// battery" — icon and menu % vanished exactly when plugged in (Tycho's bug).
+bool batteryPresent() { return g_batMvEma > 2500.0f && g_batMvEma < 4550.0f; }
 bool menuVisible(int idx) { return idx != MI_BATTERY || batteryPresent(); }
 
 // Step the selection to the next visible item; clamps at the ends (no wrap) so
