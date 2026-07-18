@@ -464,6 +464,10 @@ bool     alarmPending   = false;   // woke from deep sleep for the alarm — don
 // the label prints the percentage.)
 static int   g_batPct = -1;
 static float g_batMvEma = 0.0f;
+// The battery memory (see batteryPresent): USB hides the cell, so we keep
+// what we learned the last time we ran on it. Loaded from prefs in setup().
+static bool  g_hasBattery = false;    // a cell has been seen at least once
+static int   g_lastBatPct = -1;       // last percentage measured on battery
 
 const char* menuLabel(int idx) {
   static char buf[16];
@@ -478,7 +482,11 @@ const char* menuLabel(int idx) {
   }
   if (idx == MI_BATTERY && batteryPresent()) {
     static char bat[16];
-    snprintf(bat, sizeof(bat), "Battery %d%%", g_batPct);
+    int p = shownBatPct();
+    if (onUsbPower()) {
+      if (p >= 0) snprintf(bat, sizeof(bat), "Charging %d%%", p);
+      else        snprintf(bat, sizeof(bat), "Charging");
+    } else          snprintf(bat, sizeof(bat), "Battery %d%%", p);
     return bat;
   }
   return MENU_ITEMS[idx];
@@ -1109,26 +1117,29 @@ void cacheOverlay2Mask(const char* str) {
 
 // ── Small UI bits ────────────────────────────────────────
 void drawBatteryIcon(int x, int y, int pct) {
-  if (pct < 0) return;
+  // pct -1 = battery known to exist but never yet measured (fresh flash on
+  // USB): draw the shell + bolt, skip fill and number.
   int w = 20, h = 10;
   spr.drawRoundRect(x, y, w, h, 2, g_inkPri);
   spr.fillRect(x + w, y + 3, 2, 4, g_inkPri);
-  int fillW = ((w - 4) * pct + 50) / 100;
+  int fillW = pct < 0 ? 0 : ((w - 4) * pct + 50) / 100;
   if (fillW > 0) spr.fillRect(x + 2, y + 2, fillW, h - 4, g_inkPri);
-  // Rail at charge voltage = USB is feeding the cell: a small bolt cut out
-  // of the fill says "charging" without pretending to know the real SoC.
-  if (g_batMvEma >= 4280.0f) {
+  // On USB the cell is invisible (rail reads 4.86V): a bolt cut out of the
+  // fill says "charging" without pretending to know the real SoC.
+  if (onUsbPower()) {
     const PosterCombo& c = POSTER_COMBOS[posterIdx];
     uint16_t bg = spr.color565(c.bg[0], c.bg[1], c.bg[2]);
     spr.fillTriangle(x + 11, y + 1, x + 7, y + 6, x + 10, y + 6, bg);
     spr.fillTriangle(x + 9,  y + 9, x + 13, y + 4, x + 10, y + 4, bg);
   }
   // The number does the talking — icon fill alone was too quiet a warning.
-  char b[8]; snprintf(b, sizeof(b), "%d%%", pct);
-  spr.setTextDatum(TR_DATUM);
-  spr.setFreeFont(uiFontLabel());
-  spr.setTextColor(g_inkPri);
-  spr.drawString(b, x - 5, y - 1);
+  if (pct >= 0) {
+    char b[8]; snprintf(b, sizeof(b), "%d%%", pct);
+    spr.setTextDatum(TR_DATUM);
+    spr.setFreeFont(uiFontLabel());
+    spr.setTextColor(g_inkPri);
+    spr.drawString(b, x - 5, y - 1);
+  }
 }
 
 // ── Loading edge glow ────────────────────────────────────
@@ -1188,12 +1199,21 @@ void drawLoadingEdge() {
 }
 
 // ── Info cards (settings screens ported from globo-eink) ─
-// A LiPo reads a plausible cell voltage; on USB with no cell the VBAT pin sits
-// well above the LiPo ceiling (~4.8V), so hide the Battery item then.
-// The ceiling is 4550, NOT 4400: a cell that is CHARGING clamps the rail to
-// ~4.35-4.45V, and the old 4400 cutoff made a charging battery read as "no
-// battery" — icon and menu % vanished exactly when plugged in (Tycho's bug).
-bool batteryPresent() { return g_batMvEma > 2500.0f && g_batMvEma < 4550.0f; }
+// MEASURED on Tycho's board (2026-07-18): with USB plugged the VBAT divider
+// reads the USB rail — 4.86V — with OR without a cell attached. The battery
+// is electrically invisible behind the charger whenever USB is present, so
+// "real % while charging" does not exist on this hardware. Instead the
+// device REMEMBERS the battery: the first time it ever runs on the cell it
+// persists a has-battery flag + the last measured percentage, and on USB it
+// shows that memory with a charge bolt.
+bool onUsbPower()     { return g_batMvEma >= 4500.0f; }
+bool batteryPresent() {
+  if (onUsbPower()) return g_hasBattery;                  // remembered cell
+  return g_batMvEma > 2500.0f && g_batMvEma < 4400.0f;   // live cell
+}
+// What the UI shows: live percentage on battery, last-known while on USB
+// (-1 = battery known but never measured → icon + bolt, no number).
+int shownBatPct() { return onUsbPower() ? g_lastBatPct : g_batPct; }
 bool menuVisible(int idx) { return idx != MI_BATTERY || batteryPresent(); }
 
 // Step the selection to the next visible item; clamps at the ends (no wrap) so
@@ -1371,11 +1391,19 @@ void drawWifiHub() {
 }
 
 void drawBatteryCard() {
-  bool usb = g_batMvEma >= 4300;
+  if (onUsbPower()) {
+    // The cell hides behind the charger on USB — voltage would just read
+    // the 4.86V rail, so show the memory instead of a lie.
+    drawInfoScreen("BATTERY",
+                   "charging",
+                   g_lastBatPct >= 0 ? String(g_lastBatPct) + " % last known" : "no reading yet",
+                   "USB power");
+    return;
+  }
   drawInfoScreen("BATTERY",
                  String(g_batMvEma / 1000.0f, 2) + " V",
                  String(g_batPct) + " %",
-                 usb ? "USB power" : "On battery");
+                 "On battery");
 }
 
 
@@ -1615,13 +1643,13 @@ void renderFrame() {
 
   // Corner chrome: battery icon + percentage top-right whenever a cell is
   // attached (Tycho: always show capacity, charging or not).
-  if (batteryPresent()) drawBatteryIcon(SW - 28, 5, g_batPct);
+  if (batteryPresent()) drawBatteryIcon(SW - 28, 5, shownBatPct());
 
   // Crossing 15% on battery: one full-screen typographic moment (no sound —
   // the display speaks). 4 seconds, once per threshold-crossing.
   static bool batWarned = false;
   static uint32_t batWarnUntil = 0;
-  if (batteryPresent() && g_batPct <= 15 && !batWarned) {
+  if (!onUsbPower() && batteryPresent() && g_batPct >= 0 && g_batPct <= 15 && !batWarned) {
     batWarned = true;
     batWarnUntil = millis() + 4000;
     wakeScreen();
@@ -1664,16 +1692,26 @@ void updateBattery() {
   if (g_batMvEma == 0.0f) g_batMvEma = (float)vbatMv;
   else g_batMvEma = 0.8f * g_batMvEma + 0.2f * (float)vbatMv;
   int mv = (int)g_batMvEma;
+  if (mv >= 4500) { g_batPct = -1; return; }   // USB rail — the cell is invisible
   static const int   CURVE_MV[]  = {3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200};
   static const int   CURVE_PCT[] = {   0,    5,   10,   18,   30,   45,   60,   78,   90,  100};
   static const int   CURVE_N = 10;
-  if (mv <= CURVE_MV[0]) { g_batPct = 0; return; }
-  if (mv >= CURVE_MV[CURVE_N - 1]) { g_batPct = 100; return; }
-  for (int i = 1; i < CURVE_N; i++) {
+  if (mv <= CURVE_MV[0]) g_batPct = 0;
+  else if (mv >= CURVE_MV[CURVE_N - 1]) g_batPct = 100;
+  else for (int i = 1; i < CURVE_N; i++) {
     if (mv < CURVE_MV[i]) {
       g_batPct = CURVE_PCT[i - 1] + (CURVE_PCT[i] - CURVE_PCT[i - 1]) *
                  (mv - CURVE_MV[i - 1]) / (CURVE_MV[i] - CURVE_MV[i - 1]);
-      return;
+      break;
+    }
+  }
+  // A live cell reading is worth remembering — it's all we'll have to show
+  // the next time USB hides the battery. NVS writes throttled to ≥3% steps.
+  if (mv > 2500) {
+    if (!g_hasBattery) { g_hasBattery = true; prefs.putBool("hasBat", true); }
+    if (g_lastBatPct < 0 || abs(g_batPct - g_lastBatPct) >= 3) {
+      g_lastBatPct = g_batPct;
+      prefs.putInt("lastPct", g_batPct);
     }
   }
 }
@@ -2962,7 +3000,7 @@ void handleApiStatus() {
   portEXIT_CRITICAL(&titleMux);
 
   const Station& st = STATIONS[currentStation];
-  bool usb = g_batMvEma >= 4300;
+  bool usb = onUsbPower();
   int sleepRemain = 0;
   if (sleepAtMs) {
     long ms = (long)(sleepAtMs - millis());
@@ -2999,7 +3037,7 @@ void handleApiStatus() {
   j += ",\"armed\":"; j += alarmArmed ? "true" : "false";
   j += "},\"sleep\":{\"active\":"; j += sleepAtMs ? "true" : "false";
   j += ",\"remainMin\":"; j += sleepRemain;
-  j += "},\"battery\":{\"pct\":"; j += g_batPct;
+  j += "},\"battery\":{\"pct\":"; j += shownBatPct();
   j += ",\"usb\":"; j += usb ? "true" : "false";
   j += "},\"rssi\":"; j += WiFi.RSSI();
   j += "}";
@@ -3383,8 +3421,11 @@ void setup() {
   }
 
   analogReadResolution(12);
+  g_hasBattery = prefs.getBool("hasBat", false);   // the battery memory
+  g_lastBatPct = prefs.getInt("lastPct", -1);
   for (int i = 0; i < 5; i++) updateBattery();   // burn off EMA warm-up
-  Serial.printf("[bat] vbat=%.0fmV pct=%d\n", g_batMvEma, g_batPct);
+  Serial.printf("[bat] vbat=%.0fmV pct=%d hasBat=%d lastPct=%d\n",
+                g_batMvEma, g_batPct, (int)g_hasBattery, g_lastBatPct);
 
   randomSeed(esp_random());
   initBlobs(0);
