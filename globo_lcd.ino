@@ -1319,8 +1319,8 @@ void drawWifiHub() {
   spr.fillRect(ux, y + 12, uw, 3, g_inkPri);   // active-tab underline
 
   if (hubTab == 1) {
-    // SETUP: QR right, two lines left. The subtitle flips to live feedback
-    // the moment a phone actually joins the AP.
+    // SETUP: the ask IS the poster — "SCAN / ME IN" in stretched display
+    // type beside the QR; the AP name (or live join feedback) underneath.
     String wifiURI = "WIFI:T:nopass;S:" + String(WIFI_AP_NAME) + ";;";
     esp_qrcode_config_t cfg{};
     cfg.display_func = qrDisplayCb;
@@ -1328,34 +1328,43 @@ void drawWifiHub() {
     cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
     g_qrMargin = 8;
     esp_qrcode_generate(&cfg, wifiURI.c_str());
+    int bw = g_qrX0 - g_qrMargin - 30;   // left column width
+    cacheOverlayMask("SCAN");
+    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 16, 36, bw, 44, g_inkPri);
+    cacheOverlay2Mask("ME IN");
+    blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 16, 86, bw, 44, g_inkPri);
     int cx = (g_qrX0 - g_qrMargin) / 2;
     bool phone = WiFi.softAPgetStationNum() > 0;
-    drawTextAlpha(phone ? "phone connected" : "scan to set up",
-                  uiFontBody(), 74, 180, g_inkSec, cx);
-    drawTextAlpha(WIFI_AP_NAME, uiFontRow(), 102, 255, g_inkPri, cx);
+    drawTextAlpha(phone ? "phone connected" : WIFI_AP_NAME,
+                  uiFontBody(), 150, 200, g_inkSec, cx);
   } else {
-    // SEARCH: nothing to hunt for → an empty field (by design); otherwise
-    // the live status plus the remembered names as a soft one-by-one ticker.
+    // SEARCH: "LOOKING / FOR WIFI" edge to edge, the hunt itself as a soft
+    // line underneath — joining status or the remembered names ticking past.
+    // Nothing saved → nothing to look for → the field stays empty (by design).
     int n = min(g_savedNetCount, 8);
     if (n > 0) {
+      cacheOverlayMask("LOOKING");
+      blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 24, 32, SW - 48, 46, g_inkPri);
+      cacheOverlay2Mask("FOR WIFI");
+      blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 24, 84, SW - 48, 46, g_inkPri);
       static const char* dots[4] = {"", ".", "..", "..."};
-      String st = (wwState == WW_JOINING) ? ("joining " + wwSsid)
-                                          : String("searching");
-      st += dots[(millis() / 350) % 4];
-      drawTextAlpha(st.c_str(), uiFontRow(), 74, 255, g_inkPri);
-      uint32_t per = 1600, t = millis() % (per * n);
-      int idx = (int)(t / per);
-      float ph = (t % per) / (float)per;
-      uint8_t a = 30 + (uint8_t)(sinf(ph * (float)PI) * 200.0f);
-      char nm[33];
-      portENTER_CRITICAL(&scanMux);
-      memcpy(nm, g_savedSsids[idx], sizeof(nm));
-      portEXIT_CRITICAL(&scanMux);
-      nm[32] = '\0';
-      drawTextAlpha(nm, uiFontBody(), 112, a, g_inkSec);
+      if (wwState == WW_JOINING) {
+        String st = "joining " + wwSsid + dots[(millis() / 350) % 4];
+        drawTextAlpha(st.c_str(), uiFontBody(), 150, 220, g_inkSec);
+      } else {
+        uint32_t per = 1600, t = millis() % (per * n);
+        int idx = (int)(t / per);
+        float ph = (t % per) / (float)per;
+        uint8_t a = 30 + (uint8_t)(sinf(ph * (float)PI) * 200.0f);
+        char nm[33];
+        portENTER_CRITICAL(&scanMux);
+        memcpy(nm, g_savedSsids[idx], sizeof(nm));
+        portEXIT_CRITICAL(&scanMux);
+        nm[32] = '\0';
+        drawTextAlpha(nm, uiFontBody(), 150, a, g_inkSec);
+      }
     }
   }
-  drawTextAlpha("click: tab   hold: off", uiFontBody(), 156, 130, g_inkDim);
 }
 
 void drawBatteryCard() {
