@@ -38,8 +38,8 @@ main{position:relative;z-index:1;max-width:620px;margin:0 auto;display:flex;flex
 .dim{color:rgba(var(--inkrgb),.55)}
 /* ---------- hero ---------- */
 .hero{padding:30px 24px 26px;overflow:hidden}
-.wordmark{display:flex;align-items:center;gap:10px;font-size:12px;font-weight:900;letter-spacing:.42em;color:rgba(var(--inkrgb),.5);margin-bottom:22px}
-.wordmark b{font-weight:900;color:rgba(var(--inkrgb),.9)}
+.wordmark{display:flex;align-items:center;gap:10px;font-size:12px;font-weight:900;letter-spacing:.42em;color:var(--ink);margin-bottom:22px}
+.wordmark b{font-weight:900}
 .wordmark canvas{width:22px;height:22px;flex:none}
 .stwrap{transition:opacity .3s cubic-bezier(.2,.7,.3,1),transform .3s cubic-bezier(.2,.7,.3,1),filter .3s ease}
 .hero.out .stwrap{opacity:0;transform:translateY(16px);filter:blur(8px)}
@@ -169,13 +169,16 @@ footer{display:flex;align-items:center;justify-content:center;gap:16px;margin-to
 .bars i{width:3.5px;border-radius:2px;background:rgba(var(--inkrgb),.18);transition:background .4s ease}
 .bars i:nth-child(1){height:4px}.bars i:nth-child(2){height:7px}.bars i:nth-child(3){height:10px}.bars i:nth-child(4){height:13px}
 .bars i.on{background:rgba(var(--inkrgb),.75)}
-/* ---------- reconnect pill ---------- */
-.rec{position:fixed;top:calc(env(safe-area-inset-top) + 12px);left:50%;transform:translate(-50%,-56px);z-index:60;
-  padding:9px 18px;border-radius:99px;background:rgba(30,30,40,.85);border:1px solid rgba(var(--inkrgb),.12);
-  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  font-size:12px;font-weight:700;letter-spacing:.06em;color:rgba(255,210,50,.95);
+/* ---------- offline state ---------- */
+/* Losing the device is a state, not a footnote: the whole remote greys out
+   and a full-ink banner says so. */
+.rec{position:fixed;top:calc(env(safe-area-inset-top) + 12px);left:50%;transform:translate(-50%,-64px);z-index:60;
+  padding:12px 22px;border-radius:99px;background:var(--ink);
+  font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--bgc);
+  box-shadow:0 8px 26px rgba(0,0,0,.35);white-space:nowrap;
   transition:transform .35s cubic-bezier(.3,1.2,.4,1)}
 .rec.show{transform:translate(-50%,0)}
+.offline main{opacity:.4;filter:saturate(.25);pointer-events:none;transition:opacity .4s ease,filter .4s ease}
 @media (prefers-reduced-motion:reduce){.blob{animation:none}.dot{animation:none!important}}
 </style>
 </head>
@@ -185,7 +188,7 @@ footer{display:flex;align-items:center;justify-content:center;gap:16px;margin-to
   <div class="blob b4"></div><div class="blob b5"></div>
 </div>
 <div class="grain"></div>
-<div class="rec" id="rec">reconnecting…</div>
+<div class="rec" id="rec">not connected</div>
 
 <main>
   <!-- HERO -->
@@ -627,10 +630,16 @@ function apply(s){
 /* ----- polling ----- */
 function poll(){
   api("/api/status").then(function(s){
-    fails=0;$("#rec").classList.remove("show");apply(s);
+    fails=0;$("#rec").classList.remove("show");
+    document.body.classList.remove("offline");
+    apply(s);
   }).catch(function(){
     fails++;
-    if(fails>1)$("#rec").classList.add("show");
+    if(fails>1){
+      $("#rec").classList.add("show");
+      document.body.classList.add("offline");
+      setLive(false,false);
+    }
   });
 }
 setInterval(function(){if(!document.hidden)poll()},2500);

@@ -33,14 +33,14 @@ PRESETS = {
     "street":   [("07028153",    40, 1.0)],
     # Catalog consolidation: the standalone scapes become beds too — one list,
     # usable under the radio AND alone (via the silence carrier).
-    # waves v2: a wooden ship on open water (Tycho's timber + sails picks)
+    # waves v4: sails carry the ship, timber barely whispers (Tycho: "more of
+    # the sails and less of the wood squaking. the water is fine")
     "waves":    [("NHU05040122", 10, 1.0),   # deep evening surf
-                 ("07054094",    20, 0.25),  # timber creaking — subtle (v3)
-                 ("07034026",     2, 0.55)], # sails flapping — prominent (v3)
+                 ("07054094",    20, 0.10),  # timber creaking — a whisper
+                 ("07034026",     2, 0.85)], # sails flapping — the lead voice
     "thunder":  [("07038333",    15, 1.0)],  # thunderstorm, rumbles + claps
-    # wind v3: Tycho's pick — rattling branches, high-altitude forest
-    "wind":     [("NHU05073124", 10, 1.0),   # wind rattling branches (Tycho)
-                 ("NHU05075028", 15, 0.35)], # trees squeaking and groaning, low
+    # wind v4: pure rattling branches — the squeaking-trees layer cut (Tycho)
+    "wind":     [("NHU05073124", 10, 1.0)],  # wind rattling branches
     "train":    [("07061102",    30, 1.0)],  # railway carriage interior
 }
 

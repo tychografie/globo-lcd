@@ -472,8 +472,8 @@ const char* menuLabel(int idx) {
     else            snprintf(buf, sizeof(buf), "Alarm off");
     return buf;
   }
-  if (idx == MI_NETWORK) {  // the address *is* the label — it's a door
-    if (WiFi.status() == WL_CONNECTED) return "globo.local";
+  if (idx == MI_NETWORK) {  // says what it IS; the address appears on arrival
+    if (WiFi.status() == WL_CONNECTED) return "Remote control";
     return (wwState == WW_SCANNING || wwState == WW_JOINING) ? "Searching" : "Offline";
   }
   if (idx == MI_BATTERY && batteryPresent()) {
@@ -1096,6 +1096,17 @@ void cacheOverlayMask(const char* str) {
   renderTextMask(str, fonts56[0], ovMask, ovInkX, ovInkY, ovInkW, ovInkH);
 }
 
+// Second overlay slot: the confirm screens set their title as TWO stretched
+// display lines, so they need two cached masks at once.
+TFT_eSprite ov2Mask = TFT_eSprite(&tft);
+int ov2InkX, ov2InkY, ov2InkW, ov2InkH;
+char ov2CachedStr[16] = "";
+void cacheOverlay2Mask(const char* str) {
+  if (strcmp(str, ov2CachedStr) == 0) return;
+  strncpy(ov2CachedStr, str, sizeof(ov2CachedStr) - 1);
+  renderTextMask(str, fonts56[0], ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH);
+}
+
 // ── Small UI bits ────────────────────────────────────────
 void drawBatteryIcon(int x, int y, int pct) {
   if (pct < 0) return;
@@ -1104,6 +1115,14 @@ void drawBatteryIcon(int x, int y, int pct) {
   spr.fillRect(x + w, y + 3, 2, 4, g_inkPri);
   int fillW = ((w - 4) * pct + 50) / 100;
   if (fillW > 0) spr.fillRect(x + 2, y + 2, fillW, h - 4, g_inkPri);
+  // Rail at charge voltage = USB is feeding the cell: a small bolt cut out
+  // of the fill says "charging" without pretending to know the real SoC.
+  if (g_batMvEma >= 4280.0f) {
+    const PosterCombo& c = POSTER_COMBOS[posterIdx];
+    uint16_t bg = spr.color565(c.bg[0], c.bg[1], c.bg[2]);
+    spr.fillTriangle(x + 11, y + 1, x + 7, y + 6, x + 10, y + 6, bg);
+    spr.fillTriangle(x + 9,  y + 9, x + 13, y + 4, x + 10, y + 4, bg);
+  }
   // The number does the talking — icon fill alone was too quiet a warning.
   char b[8]; snprintf(b, sizeof(b), "%d%%", pct);
   spr.setTextDatum(TR_DATUM);
@@ -1349,15 +1368,17 @@ void drawBatteryCard() {
 
 
 // Themed No/Yes confirmation — destructive actions get a deliberate pause.
-// The question is set in the same stretched display type as a station name:
-// the decision IS the identity of this screen. The selected answer carries
-// full ink at display size; the other recedes — no boxes, pure typography.
-void drawConfirmScreen(const char* title, const char* sub, bool yesSelected) {
-  cacheOverlayMask(title);
-  blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 24, 18, SW - 48, 62, g_inkPri);
-  drawTextAlpha(sub, uiFontBody(), 96, 190, g_inkSec);
+// One friendly question set as TWO stretched display lines (the same type as
+// a station name): the decision IS the identity of this screen. No subtitle,
+// no control narration (Tycho) — just the question and No/Yes; the selected
+// answer carries full ink at display size, the other recedes.
+void drawConfirmScreen(const char* line1, const char* line2, bool yesSelected) {
+  cacheOverlayMask(line1);
+  blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 24, 12, SW - 48, 52, g_inkPri);
+  cacheOverlay2Mask(line2);
+  blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 24, 70, SW - 48, 52, g_inkPri);
 
-  const int y = 130;
+  const int y = 148;
   spr.setTextDatum(MC_DATUM);
   for (int i = 0; i < 2; i++) {
     int cx = SW / 2 + (i == 0 ? -64 : 64);
@@ -1366,7 +1387,6 @@ void drawConfirmScreen(const char* title, const char* sub, bool yesSelected) {
     spr.setTextColor(sel ? g_inkPri : g_inkDim);
     spr.drawString(i == 0 ? "No" : "Yes", cx, y);
   }
-  drawTextAlpha("turn: choose   click: confirm", uiFontBody(), 158, 150, g_inkDim);
 }
 
 // Per-stage render profiling, printed with the [ui] heartbeat line
@@ -1489,8 +1509,14 @@ void renderFrame() {
       float sel = 1.0f - constrain(ad / 0.45f, 0.0f, 1.0f);   // selectedness
       uint8_t aSmall = (uint8_t)constrain(aF * (1.0f - sel), 0.0f, 255.0f);
       uint8_t aBig   = (uint8_t)constrain(aF * sel,          0.0f, 255.0f);
-      if (aSmall > 4) drawTextAlpha(menuLabel(i), uiFontRow(), y, aSmall, g_inkPri);
-      if (aBig   > 4) drawTextAlpha(menuLabel(i), uiFontBig(), y, aBig,   g_inkPri);
+      // The network row says what it IS from afar ("Remote control") and
+      // where to GO once you arrive: the big settled word crossfades to the
+      // address itself.
+      const char* small = menuLabel(i);
+      const char* big   = (i == MI_NETWORK && WiFi.status() == WL_CONNECTED)
+                            ? "globo.local" : small;
+      if (aSmall > 4) drawTextAlpha(small, uiFontRow(), y, aSmall, g_inkPri);
+      if (aBig   > 4) drawTextAlpha(big,   uiFontBig(), y, aBig,   g_inkPri);
     }
   } else if (uiMode == MODE_INFO_NET) {
     drawNetworkCard();
@@ -1499,9 +1525,9 @@ void renderFrame() {
   } else if (uiMode == MODE_WIFI_RESET) {
     // Titles live in the display face, which is UPPERCASE-ONLY (0x20-0x5A) —
     // lowercase or '?' silently vanish ("Reset WiFi?" once drew as "R WF").
-    drawConfirmScreen("RESET WIFI", "forgets all networks + restarts", wifiResetYes);
+    drawConfirmScreen("FORGET ALL", "WIFI?", wifiResetYes);
   } else if (uiMode == MODE_OFF_CONFIRM) {
-    drawConfirmScreen("TURN OFF", "press the knob to wake it again", powerOffYes);
+    drawConfirmScreen("TIME TO", "SLEEP?", powerOffYes);
   } else if (uiMode == MODE_WIFI_HUB) {
     drawWifiHub();
   } else if (uiMode == MODE_BROWSE) {
@@ -1575,9 +1601,9 @@ void renderFrame() {
     // Demo mode shows just the station name/city — no "DEMO" label, no counter.
   }
 
-  // Corner chrome: low-battery icon top-right (the armed alarm time is now the
-  // big centre clock, so no small corner readout needed).
-  if (batteryPresent() && g_batPct <= 25) drawBatteryIcon(SW - 28, 5, g_batPct);
+  // Corner chrome: battery icon + percentage top-right whenever a cell is
+  // attached (Tycho: always show capacity, charging or not).
+  if (batteryPresent()) drawBatteryIcon(SW - 28, 5, g_batPct);
 
   // Crossing 15% on battery: one full-screen typographic moment (no sound —
   // the display speaks). 4 seconds, once per threshold-crossing.
@@ -1614,15 +1640,30 @@ void renderFrame() {
 }
 
 // ── Battery ──────────────────────────────────────────────
+// No fuel gauge on this board — the divider on VBAT is all there is, so the
+// percentage is a voltage estimate. A 1S LiPo discharges NON-linearly (long
+// 3.7-3.9V plateau); the old linear map read ~55% for a half-full cell. This
+// piecewise curve tracks a typical cell much closer. While charging the
+// charger lifts the rail toward 4.2-4.35V, so the estimate runs optimistic —
+// physics, not fixable without a gauge chip.
 void updateBattery() {
   int pinMv = analogReadMilliVolts(PIN_BAT_ADC);
   int vbatMv = pinMv * 2;   // undo the 100k/100k divider
   if (g_batMvEma == 0.0f) g_batMvEma = (float)vbatMv;
   else g_batMvEma = 0.8f * g_batMvEma + 0.2f * (float)vbatMv;
   int mv = (int)g_batMvEma;
-  if (mv <= BAT_EMPTY_MV) g_batPct = 0;
-  else if (mv >= BAT_FULL_MV) g_batPct = 100;
-  else g_batPct = (mv - BAT_EMPTY_MV) * 100 / (BAT_FULL_MV - BAT_EMPTY_MV);
+  static const int   CURVE_MV[]  = {3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200};
+  static const int   CURVE_PCT[] = {   0,    5,   10,   18,   30,   45,   60,   78,   90,  100};
+  static const int   CURVE_N = 10;
+  if (mv <= CURVE_MV[0]) { g_batPct = 0; return; }
+  if (mv >= CURVE_MV[CURVE_N - 1]) { g_batPct = 100; return; }
+  for (int i = 1; i < CURVE_N; i++) {
+    if (mv < CURVE_MV[i]) {
+      g_batPct = CURVE_PCT[i - 1] + (CURVE_PCT[i] - CURVE_PCT[i - 1]) *
+                 (mv - CURVE_MV[i - 1]) / (CURVE_MV[i] - CURVE_MV[i - 1]);
+      return;
+    }
+  }
 }
 
 // ── Screen timeout / backlight (tPod) ────────────────────
@@ -2884,8 +2925,14 @@ String jsonEscape(const char* s) {
   return out;
 }
 
+// Telemetry follows whoever talks to us: every JSON request records its
+// client as the heartbeat target (stored as a raw u32 so the cross-task
+// write is atomic). No more hardcoded home-Mac IP — dead on the road.
+volatile uint32_t g_telemTarget = 0;
+
 void webSendJson(const String& body) {
   g_webHits++;
+  g_telemTarget = (uint32_t)server.client().remoteIP();
   server.sendHeader("Cache-Control", "no-store");
   // Keep-alive on a one-client-at-a-time server is how it goes deaf: an idle
   // kept-alive client (curl, a Bonjour prober, a phone) parks in the single
@@ -3154,16 +3201,40 @@ void webSetup() {
       if (!fn.startsWith("/")) fn = "/" + fn;
       FFat.remove(fn);
     }
-    String j = "{\"ok\":true,\"free\":" + String(FFat.freeBytes()) + ",\"files\":[";
+    // Maintenance hatch: a brownout mid-write can corrupt the FAT root
+    // directory — mount still succeeds, direct opens work, but enumeration
+    // comes back empty and the orphaned clusters eat the volume. format=1
+    // rebuilds the FS from scratch (caller re-uploads after; make sure the
+    // device is in QUIET first so nothing is reading a bed).
+    if (server.hasArg("format")) {
+      g_uploadActive = true;               // pause the bed reader
+      if (radioOff) g_stopRequest = true;  // and any FFat playback
+      delay(50);
+      FFat.end();
+      bool fmtOk = FFat.format();
+      bool mntOk = FFat.begin(true);
+      g_uploadActive = false;
+      webSendJson(String("{\"ok\":") + (fmtOk && mntOk ? "true" : "false") +
+                  ",\"formatted\":true,\"free\":" + String(FFat.freeBytes()) + "}");
+      return;
+    }
+    String j = "{\"ok\":true,\"free\":" + String(FFat.freeBytes()) +
+               ",\"used\":" + String(FFat.usedBytes()) + ",\"files\":[";
     File root = FFat.open("/");
     bool first = true;
-    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-      if (!first) j += ',';
-      first = false;
-      j += "{\"name\":\""; j += jsonEscape(f.name());
-      j += "\",\"size\":"; j += (int)f.size(); j += "}";
+    if (root && root.isDirectory()) {
+      root.rewindDirectory();
+      for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+        if (!first) j += ',';
+        first = false;
+        j += "{\"name\":\""; j += jsonEscape(f.name());
+        j += "\",\"size\":"; j += (int)f.size(); j += "}";
+      }
     }
-    j += "]}";
+    j += "]";
+    if (!root) j += ",\"err\":\"root open failed\"";
+    else if (!root.isDirectory()) j += ",\"err\":\"root is not a dir\"";
+    j += "}";
     webSendJson(j);
   });
   server.on("/api/alarm",    handleApiAlarm);
@@ -3500,9 +3571,12 @@ void loop() {
                   (unsigned)audio.getBitRate(), (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getFreePsram(), (int)ps, (unsigned)g_webHits);
     if (WiFi.status() == WL_CONNECTED) {
-      // Unicast the vitals (mesh APs drop client-to-client broadcast).
-      // Debug listener during development: the Mac at .92.
-      telem.beginPacket(IPAddress(192, 168, 1, 92), 9909);
+      // Unicast the vitals to the last web client (the mesh drops
+      // client-to-client broadcast, so unicast is the reliable path; the
+      // remote's 2.5s status poll keeps the target fresh). Before anyone
+      // has talked to us: broadcast, which at least works on hotspots.
+      IPAddress dst = g_telemTarget ? IPAddress(g_telemTarget) : WiFi.broadcastIP();
+      telem.beginPacket(dst, 9909);
       telem.printf("[hb] up=%lus run=%d kbps=%u buf=%u heap=%u ps=%d web=%u rssi=%d ip=%s",
                    millis() / 1000, (int)audio.isRunning(),
                    (unsigned)audio.getBitRate(), (unsigned)audio.inBufferFilled(),
