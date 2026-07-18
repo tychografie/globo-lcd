@@ -41,7 +41,7 @@
 #include <FS.h>
 using fs::FS;          // TFT_eSPI defines FS_NO_GLOBALS on S3, undo it
 #include <WiFi.h>
-#include <WiFiManager.h>
+#include <DNSServer.h>   // captive redirect for the offline setup hub
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
@@ -184,8 +184,8 @@ uint32_t sleepFadeStartMs = 0;
 #define SLEEP_FADE_MS 15000
 
 // ── WiFi ─────────────────────────────────────────────────
-// Configured via WiFiManager captive portal — no creds in code. First boot
-// (or after a wipe) brings up an open AP with a join-QR on screen.
+// No creds in code: first boot (or a wipe) raises the offline hub — an open
+// AP with our own captive setup page, and a join-QR on the LCD's SETUP tab.
 const char* WIFI_AP_NAME = "Globo-Setup";
 
 // Runtime WiFi watcher — the travel fix. Boot-time ensureWiFi() is a one-shot,
@@ -212,6 +212,32 @@ static int       g_savedNetCount = 0;   // cached — NVS is too slow per frame
 // Services that normally start in setup() right after a successful connect.
 // When the first connect happens mid-session (watcher), they start then.
 static bool g_webUp = false, g_ntpUp = false;
+
+// ── Offline hub: soft-AP + captive setup page + search, all at once ──
+// While offline the device runs WIFI_AP_STA: the Globo-Setup AP serves a
+// poster-styled setup page (our own web server + DNS hijack — WiFiManager is
+// gone) WHILE the watcher keeps scanning for remembered networks. The LCD
+// shows a two-tab hub (SEARCH | SETUP); menu and radio are online-only.
+static DNSServer g_dns;
+static bool g_hubUp = false;
+static int  hubTab  = 1;               // 0 = SEARCH, 1 = SETUP (set on hub start)
+
+// Last scan results, cached for the setup page — written by the watcher on
+// scan completion (loop task), read by /api/scan (web task). Mux-guarded.
+struct ScanHit { char ssid[33]; int8_t rssi; bool known; };
+static ScanHit g_scanHits[15];
+static volatile int g_scanHitCount = 0;
+static portMUX_TYPE scanMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Saved-network names for the hub's SEARCH ticker (UI task reads these; NVS
+// is too slow to query per frame).
+static char g_savedSsids[8][33];
+
+// A credential fresh from the setup page jumps the watcher's queue.
+static String wwForceSsid, wwForcePsk;
+static volatile bool wwForcePending = false;
+void startWifiHub();
+void stopWifiHub();
 
 // Explicit prototypes: the .ino auto-prototype misses these (each is used
 // before its definition — the retry hook in onShortPress, the web bring-up
@@ -359,6 +385,7 @@ enum UiMode {
   MODE_INFO_BAT,     // voltage / charge card
   MODE_WIFI_RESET,   // No/Yes confirmation, then wipe + restart
   MODE_OFF_CONFIRM,  // "Turn off?" No/Yes before deep sleep
+  MODE_WIFI_HUB,     // offline: SEARCH | SETUP tabs (watcher + captive AP)
 };
 UiMode uiMode = MODE_RADIO;
 bool g_splashPreview = false;   // dev: uiTask renders the boot splash instead
@@ -1241,17 +1268,75 @@ void drawNetworkCard() {
   g_qrMargin = 8;
   esp_qrcode_generate(&cfg, url.c_str());   // draws card + code, sets g_qrX0
 
+  // Just the address and the code — no label, no narration (Tycho).
   int cx = (g_qrX0 - g_qrMargin) / 2;   // text column left of the code
-  drawTextAlpha("REMOTE", uiFontLabel(), 28, 220, g_inkPri, cx);
-  drawTextAlpha("scan to open", uiFontBody(), 54, 170, g_inkSec, cx);
   if (g_netShowIp) {
-    drawTextAlpha(WiFi.localIP().toString().c_str(), uiFontRow(), 86, 255, g_inkPri, cx);
-    drawTextAlpha("turn: globo.local", uiFontBody(), 116, 150, g_inkDim, cx);
+    drawTextAlpha(WiFi.localIP().toString().c_str(), uiFontRow(), 62, 255, g_inkPri, cx);
+    drawTextAlpha("turn for url", uiFontBody(), 94, 150, g_inkDim, cx);
   } else {
-    drawTextAlpha("globo.local", uiFontRow(), 86, 255, g_inkPri, cx);
-    drawTextAlpha("turn: show ip", uiFontBody(), 116, 150, g_inkDim, cx);
+    drawTextAlpha("globo.local", uiFontRow(), 62, 255, g_inkPri, cx);
+    drawTextAlpha("turn for ip", uiFontBody(), 94, 150, g_inkDim, cx);
   }
-  drawTextAlpha("click: back", uiFontBody(), 148, 140, g_inkDim, cx);
+  drawTextAlpha("click: back", uiFontBody(), 122, 140, g_inkDim, cx);
+}
+
+// ── The offline hub screen: SEARCH | SETUP ───────────────
+// Two tabs on distinct poster fields (renderFrame swaps the combo). SEARCH
+// shows the hunt — status line plus the remembered networks fading past one
+// by one (empty when nothing is saved, by design). SETUP is the join-QR for
+// the Globo-Setup AP with its captive setup page. Tap or turn flips the tab;
+// hold reaches TURN OFF (the only other place you can go while offline).
+void drawWifiHub() {
+  spr.setTextDatum(TL_DATUM);
+  spr.setFreeFont(uiFontLabel());
+  int x = 18, y = 24;
+  spr.setTextColor(hubTab == 0 ? g_inkPri : g_inkDim);
+  spr.drawString("SEARCH", x, y - 10);
+  int w1 = spr.textWidth("SEARCH");
+  spr.setTextColor(hubTab == 1 ? g_inkPri : g_inkDim);
+  spr.drawString("SETUP", x + w1 + 20, y - 10);
+  int ux = hubTab ? x + w1 + 20 : x;
+  int uw = hubTab ? spr.textWidth("SETUP") : w1;
+  spr.fillRect(ux, y + 12, uw, 3, g_inkPri);   // active-tab underline
+
+  if (hubTab == 1) {
+    // SETUP: QR right, two lines left. The subtitle flips to live feedback
+    // the moment a phone actually joins the AP.
+    String wifiURI = "WIFI:T:nopass;S:" + String(WIFI_AP_NAME) + ";;";
+    esp_qrcode_config_t cfg{};
+    cfg.display_func = qrDisplayCb;
+    cfg.max_qrcode_version = 3;
+    cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+    g_qrMargin = 8;
+    esp_qrcode_generate(&cfg, wifiURI.c_str());
+    int cx = (g_qrX0 - g_qrMargin) / 2;
+    bool phone = WiFi.softAPgetStationNum() > 0;
+    drawTextAlpha(phone ? "phone connected" : "scan to set up",
+                  uiFontBody(), 74, 180, g_inkSec, cx);
+    drawTextAlpha(WIFI_AP_NAME, uiFontRow(), 102, 255, g_inkPri, cx);
+  } else {
+    // SEARCH: nothing to hunt for → an empty field (by design); otherwise
+    // the live status plus the remembered names as a soft one-by-one ticker.
+    int n = min(g_savedNetCount, 8);
+    if (n > 0) {
+      static const char* dots[4] = {"", ".", "..", "..."};
+      String st = (wwState == WW_JOINING) ? ("joining " + wwSsid)
+                                          : String("searching");
+      st += dots[(millis() / 350) % 4];
+      drawTextAlpha(st.c_str(), uiFontRow(), 74, 255, g_inkPri);
+      uint32_t per = 1600, t = millis() % (per * n);
+      int idx = (int)(t / per);
+      float ph = (t % per) / (float)per;
+      uint8_t a = 30 + (uint8_t)(sinf(ph * (float)PI) * 200.0f);
+      char nm[33];
+      portENTER_CRITICAL(&scanMux);
+      memcpy(nm, g_savedSsids[idx], sizeof(nm));
+      portEXIT_CRITICAL(&scanMux);
+      nm[32] = '\0';
+      drawTextAlpha(nm, uiFontBody(), 112, a, g_inkSec);
+    }
+  }
+  drawTextAlpha("click: tab   hold: off", uiFontBody(), 156, 130, g_inkDim);
 }
 
 void drawBatteryCard() {
@@ -1342,6 +1427,10 @@ void renderFrame() {
   // The theme owns the WHOLE UI: background, ink colors, and the chrome
   // typeface (see uiFont*). The poster field is flat, so the loading comet
   // flips to a dark glow when the field is light.
+  // The hub owns its palette: SETUP wears Electric (bright cobalt + black,
+  // matching the phone portal page), SEARCH wears Butter (deep cobalt +
+  // butter yellow) — one glance tells the tabs apart.
+  if (uiMode == MODE_WIFI_HUB) posterIdx = hubTab ? 0 : 7;
   const PosterCombo& pc = POSTER_COMBOS[posterIdx];
   g_edgeDark = false;
   if (theme == THEME_POSTER) {
@@ -1408,9 +1497,13 @@ void renderFrame() {
   } else if (uiMode == MODE_INFO_BAT) {
     drawBatteryCard();
   } else if (uiMode == MODE_WIFI_RESET) {
-    drawConfirmScreen("Reset WiFi?", "forgets all networks + restarts", wifiResetYes);
+    // Titles live in the display face, which is UPPERCASE-ONLY (0x20-0x5A) —
+    // lowercase or '?' silently vanish ("Reset WiFi?" once drew as "R WF").
+    drawConfirmScreen("RESET WIFI", "forgets all networks + restarts", wifiResetYes);
   } else if (uiMode == MODE_OFF_CONFIRM) {
-    drawConfirmScreen("Turn off?", "press the knob to wake it again", powerOffYes);
+    drawConfirmScreen("TURN OFF", "press the knob to wake it again", powerOffYes);
+  } else if (uiMode == MODE_WIFI_HUB) {
+    drawWifiHub();
   } else if (uiMode == MODE_BROWSE) {
     // Split screen: radio column left, soundscape column right. The active
     // column carries full ink; the other recedes. Both have an OFF entry, so
@@ -1785,7 +1878,8 @@ void enterMode(UiMode m) {
 
 void exitToRadio() {
   if (uiMode == MODE_ALARM_SET) { exitAlarmMode(); return; }   // saves to NVS
-  enterMode(MODE_RADIO);
+  // Offline there is no radio to exit to — every back-out lands on the hub.
+  enterMode(WiFi.status() == WL_CONNECTED ? MODE_RADIO : MODE_WIFI_HUB);
 }
 
 void doWifiReset() {
@@ -1972,6 +2066,7 @@ void onRotate(int d) {
     case MODE_WIFI_RESET:  wifiResetYes = !wifiResetYes; uiLastInputMs = millis(); break;
     case MODE_OFF_CONFIRM: powerOffYes = !powerOffYes; uiLastInputMs = millis(); break;
     case MODE_INFO_NET:    g_netShowIp = !g_netShowIp; uiLastInputMs = millis(); break;
+    case MODE_WIFI_HUB:    hubTab ^= 1; uiLastInputMs = millis(); break;
     case MODE_BROWSE:
       if (browseCol == 0) {
         browseRadio = (browseRadio + (d > 0 ? 1 : -1) + STATION_COUNT + 1) % (STATION_COUNT + 1);
@@ -2015,12 +2110,23 @@ void onShortPress() {
       break;
     case MODE_OFF_CONFIRM:
       if (powerOffYes) enterDeepSleep(); // does not return
-      enterMode(MODE_MENU);
+      enterMode(WiFi.status() == WL_CONNECTED ? MODE_MENU : MODE_WIFI_HUB);
+      break;
+    case MODE_WIFI_HUB:
+      // Tap flips the tab; landing on SEARCH also skips the scan countdown.
+      hubTab ^= 1;
+      if (hubTab == 0) wifiWatcherRetryNow();
+      uiLastInputMs = millis();
       break;
   }
 }
 
 void onLongPress() {
+  if (uiMode == MODE_WIFI_HUB) {       // offline: hold reaches TURN OFF only
+    powerOffYes = false;
+    enterMode(MODE_OFF_CONFIRM);
+    return;
+  }
   if (uiMode == MODE_RADIO) { menuIdx = 0; enterMode(MODE_MENU); }
   else exitToRadio();
 }
@@ -2340,34 +2446,7 @@ static void qrDisplayCb(esp_qrcode_handle_t handle) {
   }
 }
 
-// First-run WiFi setup — on the poster field like everything else (first
-// impressions ARE the brand). Ink typography left, QR on its white quiet-zone
-// card right. The card is the only white: scanners need the contrast.
-void drawQRPortal(const char* ssid) {
-  String wifiURI = "WIFI:T:nopass;S:" + String(ssid) + ";;";
-
-  const PosterCombo& c = POSTER_COMBOS[posterIdx];
-  renderPosterBg();
-  g_inkPri = spr.color565(c.ink[0], c.ink[1], c.ink[2]);
-  g_inkSec = spr.color565(c.ink2[0], c.ink2[1], c.ink2[2]);
-  g_inkDim = spr.color565((c.ink[0] + c.bg[0]) / 2, (c.ink[1] + c.bg[1]) / 2,
-                          (c.ink[2] + c.bg[2]) / 2);
-
-  esp_qrcode_config_t cfg{};
-  cfg.display_func = qrDisplayCb;
-  cfg.max_qrcode_version = 3;
-  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
-  g_qrMargin = 8;
-  esp_qrcode_generate(&cfg, wifiURI.c_str());   // draws card + code, sets g_qrX0
-
-  // Two lines, nothing else — the QR is the interface (Tycho: no "HELLO",
-  // no portal narration).
-  int cx = (g_qrX0 - g_qrMargin) / 2;
-  drawTextAlpha("scan to set up", uiFontBody(), 70, 180, g_inkSec, cx);
-  drawTextAlpha(ssid, uiFontRow(), 98, 255, g_inkPri, cx);
-
-  spr.pushSprite(0, 0);
-}
+// (First-run setup now lives on the hub screen — drawWifiHub's SETUP tab.)
 
 // We keep every (ssid, psk) the user has ever joined, not just the last one.
 // Namespace kept from tPod so networks saved on that build survive the merge.
@@ -2391,6 +2470,14 @@ std::vector<WifiCred> loadSavedNetworks() {
   }
   wifiPrefs.end();
   g_savedNetCount = (int)out.size();   // keep the UI's cached count honest
+  portENTER_CRITICAL(&scanMux);        // + names for the hub's SEARCH ticker
+  for (int i = 0; i < 8; i++) {
+    if (i < (int)out.size()) {
+      strncpy(g_savedSsids[i], out[i].ssid.c_str(), 32);
+      g_savedSsids[i][32] = '\0';
+    } else g_savedSsids[i][0] = '\0';
+  }
+  portEXIT_CRITICAL(&scanMux);
   return out;
 }
 
@@ -2534,73 +2621,15 @@ static bool tryConnect(const String& ssid, const String& psk, uint32_t timeoutMs
   return false;
 }
 
-// Captive-portal restyle: the stock WiFiManager page is grey-on-white 2015
-// web. This head element reskins it to the poster identity — the same design
-// language as globo.local: flat electric-blue field, near-black ink, outlined
-// cards, film grain, the stretched GLOBO display type. Served only on setup,
-// but first impressions ARE the brand.
-static const char PORTAL_HEAD[] PROGMEM = R"css(
-<style>
-:root{color-scheme:light}
-body{background:#2350ff;color:#0c0c10;
- font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
- min-height:100vh;margin:0;padding:0 14px}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.08;
- background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E")}
-.wrap{max-width:400px;margin:5vh auto 6vh;padding:28px 22px 24px;border-radius:16px;
- background:rgba(12,12,16,.04);border:2px solid #0c0c10}
-h1,h2,h3{color:#0c0c10}
-h1{font-size:56px;font-weight:900;letter-spacing:-.045em;line-height:1;
- text-transform:uppercase;transform:scaleY(1.22);transform-origin:center top;
- text-align:center;margin:.15em 0 .55em}
-h3{font-size:11px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;
- color:rgba(12,12,16,.5)}
-button{background:#0c0c10;color:#f6f4ee;border:0;border-radius:14px;
- padding:15px 16px;font-size:15px;font-weight:700;letter-spacing:.02em;width:100%;
- cursor:pointer;transition:transform .16s cubic-bezier(.2,.9,.3,1.4),opacity .16s;
- margin:6px 0}
-button:active{transform:scale(.965);opacity:.85}
-input,select{background:transparent;border:2px solid rgba(12,12,16,.3);
- border-radius:12px;color:#0c0c10;padding:13px 14px;font-size:16px;width:100%;
- box-sizing:border-box;outline:none;transition:border-color .18s}
-input::placeholder{color:rgba(12,12,16,.4)}
-input:focus{border-color:#0c0c10}
-a{color:#0c0c10;font-weight:700;text-decoration:none}
-a:hover{color:#0c0c10;text-decoration:underline}
-label{display:block;font-size:11px;font-weight:700;letter-spacing:.18em;
- text-transform:uppercase;color:rgba(12,12,16,.5);margin:10px 0 0}
-hr{border:none;border-top:2px solid rgba(12,12,16,.25);margin:14px 0}
-.msg{background:none;border:2px solid rgba(12,12,16,.3);
- border-radius:12px;padding:12px 14px;font-size:14px;line-height:1.45}
-.wrap>div:has(>a[href='#p']){border:2px solid rgba(12,12,16,.3);
- border-radius:12px;padding:11px 13px;margin:8px 0;overflow:hidden}
-.wrap>div:has(>a[href='#p']) a{font-size:15px}
-</style>)css";
+// The captive setup page lives in setup_page.h (same pattern as web_page.h:
+// the .ino preprocessor mangles raw strings with inline JS).
 
+// Boot connect: try remembered networks strongest-first (scan-based — the
+// mesh lies to fast-reconnect). No blocking portal anymore: if nothing is
+// reachable, setup() raises the hub — soft-AP + captive setup page + the
+// watcher searching, all at once (AP_STA) — and the LCD shows SEARCH | SETUP.
+// The radio UI stays locked out until a link exists.
 void ensureWiFi() {
-  WiFiManager wm;
-  // A demo table usually has no WiFi. Instead of sitting in the portal (or
-  // reboot-looping) forever, give setup five minutes, then boot offline: the
-  // gradient, typography, menu — everything but the streams — still runs.
-  wm.setConfigPortalTimeout(300);
-  // Cap each waitForConnectResult at 8s — the "wait forever" default trips
-  // the boot watchdog when the saved SSID isn't reachable (boot loop).
-  wm.setConnectTimeout(8);
-  wm.setTitle("GLOBO");
-  wm.setCustomHeadElement(PORTAL_HEAD);
-  // Keep the typed credentials even when the first join fails. The hotspot
-  // trap: while the phone is parked on the Globo-Setup AP filling in this
-  // portal, its OWN hotspot pauses broadcasting — so the join attempt is
-  // doomed by the very act of configuring it. With breakAfterConfig the
-  // portal closes after save regardless; we remember the creds below and
-  // connect the moment the phone lets go and the hotspot comes back.
-  wm.setBreakAfterConfig(true);
-  static WiFiManagerParameter hotspotHint(
-    "<div class='msg'>Using a phone hotspot? Keep the hotspot settings screen "
-    "open on the phone until Globo is connected. iPhone: turn on "
-    "<b>Maximize Compatibility</b> &mdash; Globo speaks 2.4&thinsp;GHz only.</div>");
-  wm.addParameter(&hotspotHint);
-
   // Hold the encoder button at boot >1.2s to wipe saved creds.
   uint32_t holdStart = millis();
   bool wipe = false;
@@ -2610,7 +2639,7 @@ void ensureWiFi() {
   }
   if (wipe) {
     Serial.println("[wifi] encoder held at boot — wiping saved credentials");
-    wm.resetSettings();
+    WiFi.disconnect(true, true);   // also erases the core's stored creds
     wipeSavedNetworks();
   }
 
@@ -2649,64 +2678,12 @@ void ensureWiFi() {
         return;
       }
     }
-    Serial.println("[wifi] no remembered network reachable; opening portal");
+    Serial.println("[wifi] no remembered network reachable");
   }
 
-  // Fall back to the captive portal + QR code on screen.
-  // Portal window: the full 5 minutes on a virgin device, but only 90s once
-  // networks are remembered — on the road the portal usually opens just
-  // because the hotspot wasn't broadcasting YET, and the sooner it closes,
-  // the sooner the watcher starts scanning for it. A phone attached to the
-  // AP always holds the portal open (setAPClientCheck), so nobody gets cut
-  // off mid-password.
-  // A virgin device has literally nothing else to do — the portal never
-  // gives up (Tycho: work on getting the WiFi, don't "start" offline).
-  wm.setConfigPortalTimeout(saved.empty() ? 0 : 90);
-  wm.setAPClientCheck(true);
-  wm.setAPCallback([](WiFiManager* m){
-    Serial.printf("[wifi] config portal up: SSID=%s IP=%s\n",
-                  WIFI_AP_NAME, WiFi.softAPIP().toString().c_str());
-    drawQRPortal(WIFI_AP_NAME);
-  });
-
-  Serial.println("[wifi] autoConnect()...");
-  bool ok = wm.autoConnect(WIFI_AP_NAME, nullptr);
-  if (!ok) {
-    // Portal closed without a live link — but if credentials WERE typed
-    // (breakAfterConfig), the join probably failed only because the phone was
-    // still holding the portal open (see above). The AP is down now, the
-    // phone has let go, the hotspot is waking back up: remember the creds
-    // and give the join a couple of clean STA-mode tries.
-    String ssid = wm.getWiFiSSID(true), psk = wm.getWiFiPass(true);
-    if (ssid.length()) {
-      // Only burn retry time on credentials that are actually NEW — a portal
-      // that merely timed out hands back whatever the core already had
-      // stored, and the scan above already ruled those networks out.
-      bool fresh = true;
-      for (auto& c : loadSavedNetworks())
-        if (c.ssid == ssid && c.psk == psk) { fresh = false; break; }
-      rememberNetwork(ssid, psk);
-      if (fresh) {
-        WiFi.mode(WIFI_STA);
-        for (int i = 0; i < 3 && WiFi.status() != WL_CONNECTED; i++)
-          tryConnect(ssid, psk, 10000);
-      }
-    }
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[wifi] connected, ip=%s rssi=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    rememberNetwork(WiFi.SSID(), WiFi.psk());
-  } else {
-    // Offline is a state, not a verdict: visuals and menu run, the radio
-    // politely reports "no WiFi" — and the watcher keeps scanning, so the
-    // moment a remembered network (a hotspot, say) shows up, Globo joins it
-    // without a reboot. WiFi therefore stays in STA, not OFF.
-    Serial.println("[wifi] no connection — offline, watcher armed");
-    WiFi.mode(WIFI_STA);
-    wwState = WW_WAIT;
-    wwNextMs = millis() + 5000;
-  }
+  // Offline. The watcher arms here; setup() raises the hub right after.
+  wwState  = WW_WAIT;
+  wwNextMs = millis() + 3000;
 }
 
 // ── Runtime WiFi watcher (see the state block up top) ────
@@ -2722,6 +2699,7 @@ void wifiWatcherRetryNow() {           // the NETWORK card's click-to-search
 static void onWifiRegained() {
   Serial.printf("[wifi] online: '%s' ip=%s rssi=%d\n", WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  stopWifiHub();                       // AP + captive DNS down, pure STA
   wwState = WW_ONLINE;
   wwLastResult[0] = '\0';
   rememberNetwork(WiFi.SSID(), WiFi.psk());
@@ -2732,9 +2710,9 @@ static void onWifiRegained() {
     g_webUp = true;
     WiFi.setSleep(WIFI_PS_NONE);       // mDNS init can re-enable PS
   }
-  // If the UI is parked on the NETWORK card (the offline boot hub), the
-  // reconnect graduates it to the radio — listening resumes below.
-  if (uiMode == MODE_INFO_NET) enterMode(MODE_RADIO);
+  // The hub (or the old network card) graduates to the radio — listening
+  // resumes below.
+  if (uiMode == MODE_WIFI_HUB || uiMode == MODE_INFO_NET) enterMode(MODE_RADIO);
   // The radio went idle when the link died (validateStream's "no WiFi"
   // branch). If it should be playing, pick the stream back up. A stream
   // that's still nominally running recovers on its own via the EOF handler
@@ -2763,8 +2741,26 @@ void serviceWifiWatcher() {
       wwNextMs = now + WW_DROP_GRACE_MS;
       break;
     case WW_WAIT:
+      // A credential fresh from the setup page jumps the queue — join it right
+      // now, even with the phone still attached to the AP (a normal router
+      // accepts; a paused hotspot fails and falls back into the cycle).
+      if (wwForcePending) {
+        wwForcePending = false;
+        Serial.printf("[wifi] watcher: joining '%s' (from setup page)\n", wwForceSsid.c_str());
+        WiFi.begin(wwForceSsid.c_str(), wwForcePsk.c_str());
+        wwSsid   = wwForceSsid;
+        wwJoinT0 = now;
+        wwState  = WW_JOINING;
+        break;
+      }
       if ((int32_t)(now - wwNextMs) < 0) break;
-      if (g_savedNetCount <= 0) { wwNextMs = now + WW_SCAN_EVERY_MS; break; }
+      // While a phone sits on the setup AP the radio belongs to the portal —
+      // a scan would hiccup it. The hunt resumes the moment it lets go, which
+      // is exactly when a just-configured hotspot comes back on air.
+      if (g_hubUp && WiFi.softAPgetStationNum() > 0) { wwNextMs = now + 3000; break; }
+      // With the hub up we scan even with nothing saved — the setup page's
+      // network list feeds from these results.
+      if (g_savedNetCount <= 0 && !g_hubUp) { wwNextMs = now + WW_SCAN_EVERY_MS; break; }
       // Same fast async scan as boot. disconnect() first: the core may still
       // be quietly re-associating, and a scan under that fails or lies.
       WiFi.disconnect(false, false);
@@ -2778,6 +2774,32 @@ void serviceWifiWatcher() {
       int32_t bestRssi = INT32_MIN;
       if (found > 0) {
         auto saved = loadSavedNetworks();
+        // Cache what's on the air for the setup page (/api/scan): dedup by
+        // SSID keeping the strongest, mark the remembered ones.
+        ScanHit tmp[15];
+        int keep = 0;
+        for (int j = 0; j < found && keep < 15; j++) {
+          String s = WiFi.SSID(j);
+          if (!s.length()) continue;
+          bool dup = false;
+          for (int k = 0; k < keep; k++)
+            if (s.equals(tmp[k].ssid)) {
+              if (WiFi.RSSI(j) > tmp[k].rssi) tmp[k].rssi = (int8_t)WiFi.RSSI(j);
+              dup = true; break;
+            }
+          if (dup) continue;
+          strncpy(tmp[keep].ssid, s.c_str(), 32);
+          tmp[keep].ssid[32] = '\0';
+          tmp[keep].rssi  = (int8_t)constrain(WiFi.RSSI(j), -127, 0);
+          tmp[keep].known = false;
+          for (auto& c : saved)
+            if (c.ssid == s) { tmp[keep].known = true; break; }
+          keep++;
+        }
+        portENTER_CRITICAL(&scanMux);
+        memcpy((void*)g_scanHits, tmp, sizeof(tmp));
+        g_scanHitCount = keep;
+        portEXIT_CRITICAL(&scanMux);
         for (auto& c : saved)
           for (int j = 0; j < found; j++)
             if (WiFi.SSID(j) == c.ssid && WiFi.RSSI(j) > bestRssi) {
@@ -2814,12 +2836,40 @@ void serviceWifiWatcher() {
   }
 }
 
+// ── The offline hub itself: AP + captive DNS + setup page ─
+// AP_STA is the whole point: the Globo-Setup network stays joinable WHILE
+// the watcher scans and joins — configuring and searching are not modes to
+// choose between. The setup page is served by the same WebServer as the
+// remote ("/" flips by state); DNS hijack makes every hostname land there,
+// which is what pops the phone's captive-portal sheet.
+void startWifiHub() {
+  if (g_hubUp) return;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(WIFI_AP_NAME);
+  g_dns.start(53, "*", WiFi.softAPIP());
+  if (!g_webUp) { webSetup(); g_webUp = true; }
+  hubTab = g_savedNetCount > 0 ? 0 : 1;   // travellers land on SEARCH, virgins on SETUP
+  g_hubUp = true;
+  Serial.printf("[wifi] hub up: AP=%s ip=%s\n",
+                WIFI_AP_NAME, WiFi.softAPIP().toString().c_str());
+}
+
+void stopWifiHub() {
+  if (!g_hubUp) return;
+  g_dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  g_hubUp = false;
+  Serial.println("[wifi] hub down");
+}
+
 // ── Web remote: http://globo.local ───────────────────────
 // JSON API + a single-page control app (web_page.h). Handlers run in loop()
 // context — the same context as the encoder handlers — so device functions
 // are reused directly. Anything that changes state also wakes the screen, so
 // the device visibly reacts when you drive it from the phone.
 #include "web_page.h"
+#include "setup_page.h"
 
 // Minimal JSON string escape: quotes, backslashes, control chars.
 String jsonEscape(const char* s) {
@@ -2984,11 +3034,46 @@ void webTask(void*) {
 }
 
 void webSetup() {
+  // While the hub is up "/" IS the setup page — a phone that joins the AP and
+  // browses anywhere should land on WiFi setup, not on a remote that can't
+  // control anything yet.
   server.on("/", []() {
     server.sendHeader("Cache-Control", "no-cache");
     server.sendHeader("Connection", "close");
-    server.send_P(200, "text/html", INDEX_HTML);
+    server.send_P(200, "text/html", g_hubUp ? SETUP_HTML : INDEX_HTML);
     server.client().stop();
+  });
+  server.on("/setup", []() {
+    server.sendHeader("Cache-Control", "no-cache");
+    server.sendHeader("Connection", "close");
+    server.send_P(200, "text/html", SETUP_HTML);
+    server.client().stop();
+  });
+  server.on("/api/scan", []() {
+    ScanHit hits[15];
+    portENTER_CRITICAL(&scanMux);
+    int n = g_scanHitCount;
+    memcpy(hits, (const void*)g_scanHits, sizeof(hits));
+    portEXIT_CRITICAL(&scanMux);
+    String j = "{\"ok\":true,\"hits\":[";
+    for (int i = 0; i < n; i++) {
+      if (i) j += ',';
+      j += "{\"ssid\":\""; j += jsonEscape(hits[i].ssid);
+      j += "\",\"rssi\":"; j += (int)hits[i].rssi;
+      j += ",\"known\":"; j += hits[i].known ? "true" : "false"; j += "}";
+    }
+    j += "]}";
+    webSendJson(j);
+  });
+  server.on("/api/wifisave", []() {
+    String s = server.arg("s"), p = server.arg("p");
+    if (!s.length()) { webSendJson("{\"ok\":false}"); return; }
+    Serial.printf("[wifi] setup page: creds for '%s'\n", s.c_str());
+    rememberNetwork(s, p);
+    wwForceSsid = s;                   // watcher joins it on its next pass
+    wwForcePsk  = p;
+    wwForcePending = true;
+    webSendJson("{\"ok\":true}");
   });
   server.on("/api/status",   handleApiStatus);
   server.on("/api/stations", handleApiStations);
@@ -3099,7 +3184,7 @@ void webSetup() {
         browseCol = 0;
         browseRadio = radioOff ? 0 : currentStation + 1;
         browseBed = mixAutoSel;
-        enterMode((UiMode)constrain(m, 0, (int)MODE_OFF_CONFIRM));
+        enterMode((UiMode)constrain(m, 0, (int)MODE_WIFI_HUB));
       }
     }
     webSendJson(String("{\"ok\":true,\"mode\":") + (int)uiMode + "}");
@@ -3118,6 +3203,15 @@ void webSetup() {
     server.client().stop();
   });
   server.onNotFound([]() {
+    // Hub captive catch: the DNS hijack points every hostname here, and the
+    // 302 to our own IP is what pops the phone's captive-portal sheet.
+    if (g_hubUp) {
+      server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+      server.sendHeader("Connection", "close");
+      server.send(302, "text/plain", "");
+      server.client().stop();
+      return;
+    }
     server.sendHeader("Connection", "close");
     server.send(404, "application/json", "{\"ok\":false}");
     server.client().stop();
@@ -3259,10 +3353,11 @@ void setup() {
     g_connectRequest = true;
   } else if (!online) {
     g_loading = false;
-    // Offline is a WiFi problem, not a listening mode: boot into the NETWORK
-    // card (live watcher status) instead of a radio screen that can't play.
-    enterMode(MODE_INFO_NET);
-    Serial.println("[boot] offline — network card up, watcher searching");
+    // Offline is a WiFi problem, not a listening mode: raise the hub (AP +
+    // captive setup page + watcher) and show its SEARCH | SETUP tabs.
+    startWifiHub();
+    enterMode(MODE_WIFI_HUB);
+    Serial.println("[boot] offline — hub up, watcher searching");
   } else {
     g_loading = false;   // muted at boot → stay stopped until turned up
     Serial.println("[boot] volume 0 — radio stopped until turned up");
@@ -3286,6 +3381,19 @@ void loop() {
   updateFade();
   validateStream();
   serviceWifiWatcher();   // travel: rejoin remembered networks as they appear
+
+  // WiFi down (2.5s debounce so a sub-second blip doesn't yank the screen) →
+  // the hub owns the UI: AP + captive page come up and menu/radio become
+  // unreachable until the link is back. TURN OFF stays reachable via hold.
+  static uint32_t offSinceMs = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!offSinceMs) offSinceMs = now;
+    if (now - offSinceMs > 2500) {
+      if (!g_hubUp) startWifiHub();
+      if (uiMode != MODE_WIFI_HUB && uiMode != MODE_OFF_CONFIRM) enterMode(MODE_WIFI_HUB);
+    }
+  } else offSinceMs = 0;
+  if (g_hubUp) g_dns.processNextRequest();
 
   // Sleep timer: at T-0 begin a 15s fade, then stop the stream and restore
   // the volume so the next play (knob or alarm) starts at the set level.
