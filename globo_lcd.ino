@@ -146,7 +146,7 @@ void drawTextAlpha(const char* s, const GFXfont* font, int y, uint8_t alpha,
 
 // QR plumbing (shared by the setup portal and the network/remote card).
 static int g_qrX0 = 0, g_qrY0 = 0, g_qrScale = 4;
-static const int g_qrMaxN = 29;   // QR version 3
+static int g_qrMargin = 8;        // white quiet zone around the code
 
 // ── Audio ────────────────────────────────────────────────
 Audio audio;
@@ -1234,21 +1234,14 @@ void drawNetworkCard() {
   String url = g_netShowIp ? "http://" + WiFi.localIP().toString()
                            : "http://globo.local";
 
-  int margin = 8;
-  g_qrScale = (SH - 2 * margin - 12) / g_qrMaxN;
-  int qrPx = g_qrMaxN * g_qrScale;
-  g_qrX0 = SW - qrPx - 22;
-  g_qrY0 = (SH - qrPx) / 2;
-  spr.fillRoundRect(g_qrX0 - margin, g_qrY0 - margin,
-                    qrPx + 2 * margin, qrPx + 2 * margin, 6, TFT_WHITE);
-
   esp_qrcode_config_t cfg{};
   cfg.display_func = qrDisplayCb;
   cfg.max_qrcode_version = 3;
   cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
-  esp_qrcode_generate(&cfg, url.c_str());
+  g_qrMargin = 8;
+  esp_qrcode_generate(&cfg, url.c_str());   // draws card + code, sets g_qrX0
 
-  int cx = (g_qrX0 - margin) / 2;   // text column left of the code
+  int cx = (g_qrX0 - g_qrMargin) / 2;   // text column left of the code
   drawTextAlpha("REMOTE", uiFontLabel(), 28, 220, g_inkPri, cx);
   drawTextAlpha("scan to open", uiFontBody(), 54, 170, g_inkSec, cx);
   if (g_netShowIp) {
@@ -1573,6 +1566,11 @@ void wakeScreen() {
 }
 
 void updateScreenTimeout() {
+  // No going dark while offline: getting WiFi IS the job then, and a sleeping
+  // screen made the wake press read as "setup skipped" (Tycho). A screen that
+  // is ALREADY dark stays dark (a 3am mesh hiccup must not light the bedroom);
+  // the countdown just never starts. Critical-battery shutdown still protects.
+  if (WiFi.status() != WL_CONNECTED) { lastActivityMs = millis(); return; }
   // The idle countdown only starts once the first station has finished loading:
   // hold the screen lit through the whole startup/connect so a slow boot never
   // goes dark before you hear anything.
@@ -2319,9 +2317,21 @@ void registerAudioCallbacks() {
 }
 
 // ── WiFi portal + QR + saved-networks store (tPod) ───────
+// Card and code drawn together: only the generated handle knows the real
+// module count (version 1 = 21, 2 = 25, 3 = 29). Sizing the card from the
+// version-3 maximum left short URLs hugging the top-left of an oversized
+// card. Right-anchored, vertically centred; sets g_qrX0 for the caller's
+// text column.
 static void qrDisplayCb(esp_qrcode_handle_t handle) {
-  for (int y = 0; y < g_qrMaxN; y++) {
-    for (int x = 0; x < g_qrMaxN; x++) {
+  int n = esp_qrcode_get_size(handle);
+  g_qrScale = (SH - 2 * g_qrMargin - 12) / n;
+  int qrPx = n * g_qrScale;
+  g_qrX0 = SW - qrPx - 21;
+  g_qrY0 = (SH - qrPx) / 2;
+  spr.fillRoundRect(g_qrX0 - g_qrMargin, g_qrY0 - g_qrMargin,
+                    qrPx + 2 * g_qrMargin, qrPx + 2 * g_qrMargin, 6, TFT_WHITE);
+  for (int y = 0; y < n; y++) {
+    for (int x = 0; x < n; x++) {
       if (esp_qrcode_get_module(handle, x, y)) {
         spr.fillRect(g_qrX0 + x * g_qrScale, g_qrY0 + y * g_qrScale,
                      g_qrScale, g_qrScale, TFT_BLACK);
@@ -2343,26 +2353,18 @@ void drawQRPortal(const char* ssid) {
   g_inkDim = spr.color565((c.ink[0] + c.bg[0]) / 2, (c.ink[1] + c.bg[1]) / 2,
                           (c.ink[2] + c.bg[2]) / 2);
 
-  int margin = 7;
-  g_qrScale = (SH - 2 * margin - 14) / g_qrMaxN;
-  int qrPx = g_qrMaxN * g_qrScale;
-  g_qrX0 = SW - qrPx - 20;
-  g_qrY0 = (SH - qrPx) / 2;
-  spr.fillRoundRect(g_qrX0 - margin, g_qrY0 - margin,
-                    qrPx + 2 * margin, qrPx + 2 * margin, 6, TFT_WHITE);
-
   esp_qrcode_config_t cfg{};
   cfg.display_func = qrDisplayCb;
   cfg.max_qrcode_version = 3;
   cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
-  esp_qrcode_generate(&cfg, wifiURI.c_str());
+  g_qrMargin = 8;
+  esp_qrcode_generate(&cfg, wifiURI.c_str());   // draws card + code, sets g_qrX0
 
-  int cx = (g_qrX0 - margin) / 2;
-  drawTextAlpha("HELLO", uiFontLabel(), 26, 220, g_inkPri, cx);
-  drawTextAlpha("scan to set up", uiFontBody(), 54, 170, g_inkSec, cx);
-  drawTextAlpha(ssid, uiFontRow(), 86, 255, g_inkPri, cx);
-  drawTextAlpha("the portal opens", uiFontBody(), 118, 150, g_inkDim, cx);
-  drawTextAlpha("by itself", uiFontBody(), 138, 150, g_inkDim, cx);
+  // Two lines, nothing else — the QR is the interface (Tycho: no "HELLO",
+  // no portal narration).
+  int cx = (g_qrX0 - g_qrMargin) / 2;
+  drawTextAlpha("scan to set up", uiFontBody(), 70, 180, g_inkSec, cx);
+  drawTextAlpha(ssid, uiFontRow(), 98, 255, g_inkPri, cx);
 
   spr.pushSprite(0, 0);
 }
@@ -2533,42 +2535,46 @@ static bool tryConnect(const String& ssid, const String& psk, uint32_t timeoutMs
 }
 
 // Captive-portal restyle: the stock WiFiManager page is grey-on-white 2015
-// web. This head element reskins it to the GLOBO identity — dark, soft pastel
-// gradient blobs, film grain via a tiny SVG noise tile, frosted card, big
-// friendly type. Served only on first-run setup, but first impressions count.
+// web. This head element reskins it to the poster identity — the same design
+// language as globo.local: flat electric-blue field, near-black ink, outlined
+// cards, film grain, the stretched GLOBO display type. Served only on setup,
+// but first impressions ARE the brand.
 static const char PORTAL_HEAD[] PROGMEM = R"css(
 <style>
-:root{color-scheme:dark}
-body{background:#0e0e14;background-image:
- radial-gradient(600px 420px at 12% -8%,rgba(255,120,120,.32),transparent 60%),
- radial-gradient(640px 480px at 108% 22%,rgba(120,150,255,.30),transparent 62%),
- radial-gradient(700px 520px at 45% 118%,rgba(90,220,190,.26),transparent 60%),
- radial-gradient(460px 340px at 82% 88%,rgba(255,190,90,.20),transparent 55%);
- background-attachment:fixed;color:#f4f4f6;
+:root{color-scheme:light}
+body{background:#2350ff;color:#0c0c10;
  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
  min-height:100vh;margin:0;padding:0 14px}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.05;
+body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.08;
  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E")}
-.wrap{max-width:400px;margin:7vh auto 6vh;padding:30px 26px;border-radius:26px;
- background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);
- backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
- box-shadow:0 24px 70px rgba(0,0,0,.45)}
-h1,h2,h3{color:#fff;letter-spacing:.01em}
-h1{font-size:30px;font-weight:800;text-transform:uppercase;letter-spacing:.14em;
- text-align:center;margin:.2em 0 .9em}
-button{background:#fff;color:#0e0e14;border:0;border-radius:15px;
- padding:15px 16px;font-size:16px;font-weight:650;width:100%;cursor:pointer;
- transition:transform .16s cubic-bezier(.2,.9,.3,1.4),opacity .16s;margin:6px 0}
+.wrap{max-width:400px;margin:5vh auto 6vh;padding:28px 22px 24px;border-radius:16px;
+ background:rgba(12,12,16,.04);border:2px solid #0c0c10}
+h1,h2,h3{color:#0c0c10}
+h1{font-size:56px;font-weight:900;letter-spacing:-.045em;line-height:1;
+ text-transform:uppercase;transform:scaleY(1.22);transform-origin:center top;
+ text-align:center;margin:.15em 0 .55em}
+h3{font-size:11px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;
+ color:rgba(12,12,16,.5)}
+button{background:#0c0c10;color:#f6f4ee;border:0;border-radius:14px;
+ padding:15px 16px;font-size:15px;font-weight:700;letter-spacing:.02em;width:100%;
+ cursor:pointer;transition:transform .16s cubic-bezier(.2,.9,.3,1.4),opacity .16s;
+ margin:6px 0}
 button:active{transform:scale(.965);opacity:.85}
-input,select{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);
- border-radius:13px;color:#fff;padding:13px 14px;font-size:16px;width:100%;
+input,select{background:transparent;border:2px solid rgba(12,12,16,.3);
+ border-radius:12px;color:#0c0c10;padding:13px 14px;font-size:16px;width:100%;
  box-sizing:border-box;outline:none;transition:border-color .18s}
-input:focus{border-color:rgba(255,255,255,.42)}
-a{color:#aac4ff;text-decoration:none}
-a:hover{text-decoration:underline}
-.msg{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
- border-radius:13px;padding:12px 14px}
-.q{filter:invert(1) brightness(1.6)}
+input::placeholder{color:rgba(12,12,16,.4)}
+input:focus{border-color:#0c0c10}
+a{color:#0c0c10;font-weight:700;text-decoration:none}
+a:hover{color:#0c0c10;text-decoration:underline}
+label{display:block;font-size:11px;font-weight:700;letter-spacing:.18em;
+ text-transform:uppercase;color:rgba(12,12,16,.5);margin:10px 0 0}
+hr{border:none;border-top:2px solid rgba(12,12,16,.25);margin:14px 0}
+.msg{background:none;border:2px solid rgba(12,12,16,.3);
+ border-radius:12px;padding:12px 14px;font-size:14px;line-height:1.45}
+.wrap>div:has(>a[href='#p']){border:2px solid rgba(12,12,16,.3);
+ border-radius:12px;padding:11px 13px;margin:8px 0;overflow:hidden}
+.wrap>div:has(>a[href='#p']) a{font-size:15px}
 </style>)css";
 
 void ensureWiFi() {
@@ -2653,7 +2659,9 @@ void ensureWiFi() {
   // the sooner the watcher starts scanning for it. A phone attached to the
   // AP always holds the portal open (setAPClientCheck), so nobody gets cut
   // off mid-password.
-  wm.setConfigPortalTimeout(saved.empty() ? 300 : 90);
+  // A virgin device has literally nothing else to do — the portal never
+  // gives up (Tycho: work on getting the WiFi, don't "start" offline).
+  wm.setConfigPortalTimeout(saved.empty() ? 0 : 90);
   wm.setAPClientCheck(true);
   wm.setAPCallback([](WiFiManager* m){
     Serial.printf("[wifi] config portal up: SSID=%s IP=%s\n",
@@ -2724,6 +2732,9 @@ static void onWifiRegained() {
     g_webUp = true;
     WiFi.setSleep(WIFI_PS_NONE);       // mDNS init can re-enable PS
   }
+  // If the UI is parked on the NETWORK card (the offline boot hub), the
+  // reconnect graduates it to the radio — listening resumes below.
+  if (uiMode == MODE_INFO_NET) enterMode(MODE_RADIO);
   // The radio went idle when the link died (validateStream's "no WiFi"
   // branch). If it should be playing, pick the stream back up. A stream
   // that's still nominally running recovers on its own via the EOF handler
@@ -3247,8 +3258,11 @@ void setup() {
     connectStartMs = millis();
     g_connectRequest = true;
   } else if (!online) {
-    g_loading = false;   // offline demo: visuals only, radio idle
-    Serial.println("[boot] offline — radio idle, visuals running");
+    g_loading = false;
+    // Offline is a WiFi problem, not a listening mode: boot into the NETWORK
+    // card (live watcher status) instead of a radio screen that can't play.
+    enterMode(MODE_INFO_NET);
+    Serial.println("[boot] offline — network card up, watcher searching");
   } else {
     g_loading = false;   // muted at boot → stay stopped until turned up
     Serial.println("[boot] volume 0 — radio stopped until turned up");
