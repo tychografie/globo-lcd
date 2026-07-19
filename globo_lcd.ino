@@ -1353,13 +1353,13 @@ void drawWifiHub() {
     esp_qrcode_generate(&cfg, wifiURI.c_str());
     int bw = g_qrX0 - g_qrMargin - 30;   // left column width
     cacheOverlayMask("SCAN");
-    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 16, 36, bw, 44, g_inkPri);
+    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 16, 46, bw, 40, g_inkPri);
     cacheOverlay2Mask("ME IN");
-    blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 16, 86, bw, 44, g_inkPri);
+    blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 16, 94, bw, 40, g_inkPri);
     int cx = (g_qrX0 - g_qrMargin) / 2;
     bool phone = WiFi.softAPgetStationNum() > 0;
     drawTextAlpha(phone ? "phone connected" : WIFI_AP_NAME,
-                  uiFontBody(), 150, 200, g_inkSec, cx);
+                  uiFontBody(), 152, 200, g_inkSec, cx);
   } else {
     // SEARCH: "LOOKING / FOR WIFI" edge to edge, the hunt itself as a soft
     // line underneath — joining status or the remembered names ticking past.
@@ -1367,13 +1367,13 @@ void drawWifiHub() {
     int n = min(g_savedNetCount, 8);
     if (n > 0) {
       cacheOverlayMask("LOOKING");
-      blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 24, 32, SW - 48, 46, g_inkPri);
+      blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 24, 46, SW - 48, 40, g_inkPri);
       cacheOverlay2Mask("FOR WIFI");
-      blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 24, 84, SW - 48, 46, g_inkPri);
+      blitMask(ov2Mask, ov2InkX, ov2InkY, ov2InkW, ov2InkH, 24, 94, SW - 48, 40, g_inkPri);
       static const char* dots[4] = {"", ".", "..", "..."};
       if (wwState == WW_JOINING) {
         String st = "joining " + wwSsid + dots[(millis() / 350) % 4];
-        drawTextAlpha(st.c_str(), uiFontBody(), 150, 220, g_inkSec);
+        drawTextAlpha(st.c_str(), uiFontBody(), 152, 220, g_inkSec);
       } else {
         uint32_t per = 1600, t = millis() % (per * n);
         int idx = (int)(t / per);
@@ -1487,10 +1487,11 @@ void renderFrame() {
   // The theme owns the WHOLE UI: background, ink colors, and the chrome
   // typeface (see uiFont*). The poster field is flat, so the loading comet
   // flips to a dark glow when the field is light.
-  // The hub owns its palette: SETUP wears Electric (bright cobalt + black,
-  // matching the phone portal page), SEARCH wears Butter (deep cobalt +
-  // butter yellow) — one glance tells the tabs apart.
-  if (uiMode == MODE_WIFI_HUB) posterIdx = hubTab ? 0 : 7;
+  // The hub owns its palette: SETUP wears Electric (bright cobalt + black —
+  // the same blue as the phone portal page), SEARCH wears Acid (green +
+  // black). Two genuinely different fields: one glance tells the tabs apart
+  // (Butter vs Electric were both blue — Tycho couldn't tell them apart).
+  if (uiMode == MODE_WIFI_HUB) posterIdx = hubTab ? 0 : 1;
   const PosterCombo& pc = POSTER_COMBOS[posterIdx];
   g_edgeDark = false;
   if (theme == THEME_POSTER) {
