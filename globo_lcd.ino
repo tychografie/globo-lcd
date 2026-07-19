@@ -1641,26 +1641,11 @@ void renderFrame() {
     // Demo mode shows just the station name/city — no "DEMO" label, no counter.
   }
 
-  // Corner chrome: battery icon + percentage top-right whenever a cell is
-  // attached (Tycho: always show capacity, charging or not).
-  if (batteryPresent()) drawBatteryIcon(SW - 28, 5, shownBatPct());
-
-  // Crossing 15% on battery: one full-screen typographic moment (no sound —
-  // the display speaks). 4 seconds, once per threshold-crossing.
-  static bool batWarned = false;
-  static uint32_t batWarnUntil = 0;
-  if (!onUsbPower() && batteryPresent() && g_batPct >= 0 && g_batPct <= 15 && !batWarned) {
-    batWarned = true;
-    batWarnUntil = millis() + 4000;
-    wakeScreen();
-  }
-  if (g_batPct > 20) batWarned = false;        // re-arm after a charge
-  if (millis() < batWarnUntil) {
-    char b[8]; snprintf(b, sizeof(b), "%d%%", g_batPct);
-    cacheOverlayMask(b);
-    blitMask(ovMask, ovInkX, ovInkY, ovInkW, ovInkH, 70, 34, SW - 140, 84, g_inkPri);
-    drawTextAlpha("BATTERY LOW", uiFontLabel(), 138, 230, g_inkPri);
-  }
+  // Battery lives in ONE place: top-right of the MENU, icon + percentage
+  // (bolt + last-known % while USB hides the cell). Nowhere else — the
+  // full-screen low-battery moment is gone by request; the 3% graceful
+  // shutdown in loop() still protects the cell.
+  if (uiMode == MODE_MENU && batteryPresent()) drawBatteryIcon(SW - 28, 5, shownBatPct());
 
   drawLoadingEdge();   // handles its own fade in/out, safe to call always
   g_textMs += millis() - t0;
