@@ -465,6 +465,7 @@ bool     alarmPending   = false;   // woke from deep sleep for the alarm — don
 // the label prints the percentage.)
 static int   g_batPct = -1;
 static float g_batMvEma = 0.0f;
+static bool  g_batCharging = false;   // inferred from the trend, see updateBattery
 
 const char* menuLabel(int idx) {
   static char buf[16];
@@ -479,7 +480,7 @@ const char* menuLabel(int idx) {
   }
   if (idx == MI_BATTERY && batteryPresent()) {
     static char bat[16];
-    snprintf(bat, sizeof(bat), "Battery %d%%", g_batPct);
+    snprintf(bat, sizeof(bat), g_batCharging ? "Charging %d%%" : "Battery %d%%", g_batPct);
     return bat;
   }
   return MENU_ITEMS[idx];
@@ -1373,7 +1374,7 @@ void drawBatteryCard() {
   drawInfoScreen("BATTERY",
                  String(g_batMvEma / 1000.0f, 2) + " V",
                  String(g_batPct) + " %",
-                 "On battery");
+                 g_batCharging ? "Charging" : "On battery");
 }
 
 
@@ -1666,6 +1667,30 @@ void updateBattery() {
   // burst and every loud passage down the curve.
   else if (raw > g_batMvEma) g_batMvEma += ((float)raw - g_batMvEma) * 0.25f;
   else                       g_batMvEma += ((float)raw - g_batMvEma) * 0.01f;
+
+  // ---- charging, inferred ----
+  // Nothing wires charge status in: the TP4057's CHRG pin is unconnected and
+  // the enclosure is shut. The cell gives it away anyway. This thing is always
+  // playing, so it always draws current, and a loaded cell can only fall.
+  // Measured over 4 minutes on Tycho's 14500: discharging -1.8mV/s, a full
+  // cell sitting on the charger -0.07mV/s, actively charging +1.5mV/s. Over a
+  // minute that is -108mV, -4mV and +90mV — three states nowhere near each
+  // other, so a slow trend is all it takes.
+  // Enter on a genuine rise (nothing but a charger lifts a loaded cell), leave
+  // on a genuine fall, and hold in between — that way the flat top-off phase
+  // keeps reading as charging instead of flickering off.
+  static float    trendRef = 0.0f;
+  static uint32_t trendMs  = 0;
+  uint32_t nowMs = millis();
+  if (trendRef <= 0.0f) { trendRef = g_batMvEma; trendMs = nowMs; }
+  else if (nowMs - trendMs >= 60000) {
+    float d = g_batMvEma - trendRef;
+    if      (d >=   8.0f) g_batCharging = true;
+    else if (d <= -15.0f) g_batCharging = false;
+    trendRef = g_batMvEma;
+    trendMs  = nowMs;
+  }
+
   int mv = (int)g_batMvEma;
   if (mv >= 4500) { g_batPct = -1; return; }   // USB rail — the cell is invisible
   static const int   CURVE_MV[]  = {3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200};
@@ -3059,6 +3084,7 @@ void handleApiStatus() {
   j += "},\"battery\":{\"pct\":"; j += g_batPct;
   j += ",\"usb\":"; j += usb ? "true" : "false";
   j += ",\"mv\":"; j += (int)g_batMvEma;          // diagnosis: raw rail/cell EMA
+  j += ",\"charging\":"; j += g_batCharging ? "true" : "false";
   j += "},\"rssi\":"; j += WiFi.RSSI();
   j += "}";
   webSendJson(j);
