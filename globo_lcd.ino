@@ -2351,6 +2351,40 @@ void ambService() {
 #define AGC_GATE      (180.0f  * 65536.0f)   // below this: hold gain (silence)
 #define BED_SCALE     65536.0f               // bed PCM int16 → 32-bit scale
 
+// ── Top-of-knob loudness boost ───────────────────────────
+// The knob is 0..21 and the screen shows volumeLevel*100/21, so the top three
+// detents read 90 / 95 / 100. These make that top punch above its label: 90 is
+// secretly 91, 95 is secretly 100, 100 is secretly 110. By 21/21 the library
+// sits at unity, so the extra can only be digital gain — and this hook is
+// pre-volume, so it rides the knob and the tone preset like everything else.
+// Factors are simply secret/shown: 91/90, 100/95, 110/100.
+#define VOL_BOOST_FROM 19                    // first boosted detent (shows 90)
+static const float VOL_BOOST[] = {1.011f, 1.053f, 1.100f};
+
+// Straight gain would just slam into the ±PCM_FS clamp and turn peaks into
+// hard-clip crackle — which is exactly what you'd notice first at full volume.
+// Above the knee we bend instead: x/(1+x) approaches the ceiling but never
+// reaches it, costs one divide, and only touches samples already up there.
+#define VOL_KNEE      (0.80f * PCM_FS)
+
+static void volBoostApply(int32_t* buf, int16_t frames) {
+  int idx = volumeLevel - VOL_BOOST_FROM;
+  if (idx < 0) return;                       // below 90%: untouched, bit-exact
+  if (idx > 2) idx = 2;
+  const float g = VOL_BOOST[idx];
+  const float head = PCM_FS - VOL_KNEE;
+  for (int i = 0; i < 2 * frames; i++) {
+    float v = (float)buf[i] * g;
+    float a = fabsf(v);
+    if (a > VOL_KNEE) {                      // soft knee, not a wall
+      float x = (a - VOL_KNEE) / head;
+      a = VOL_KNEE + head * (x / (1.0f + x));
+      v = v < 0 ? -a : a;
+    }
+    buf[i] = (int32_t)v;
+  }
+}
+
 void audio_process_raw_samples(int32_t* buf, int16_t frames) {
   if (frames <= 0) return;
   uint32_t rate = audio.getSampleRate();
@@ -2392,22 +2426,28 @@ void audio_process_raw_samples(int32_t* buf, int16_t frames) {
   static float ambPos = 0, ambLevel = 0;
   int am = activeMixIdx();
   float target = (am > 0 && ambRing) ? (radioOff ? BED_SOLO_LEVEL : MIXES[am - 1].level) : 0.0f;
-  if (target <= 0.001f && ambLevel <= 0.001f) return;
-  float lk = (float)1.0f / (rate * 1.5f);                     // ~1.5s fade
-  float step = 16000.0f / rate;
-  for (int i = 0; i < frames; i++) {
-    ambLevel += (target - ambLevel) * lk;                     // per-frame ease
-    float s = 0;
-    if (ambWr - ambRd > 2) {
-      int16_t a = ambRing[ambRd & (AMB_RING - 1)];
-      int16_t b = ambRing[(ambRd + 1) & (AMB_RING - 1)];
-      s = (a + (b - a) * ambPos) * ambLevel * BED_SCALE;
-      ambPos += step;
-      while (ambPos >= 1.0f) { ambPos -= 1.0f; ambRd++; }
+  // Was an early return; now a block, so the boost below still runs when no
+  // bed is playing (pure radio has to get louder too).
+  if (target > 0.001f || ambLevel > 0.001f) {
+    float lk = (float)1.0f / (rate * 1.5f);                   // ~1.5s fade
+    float step = 16000.0f / rate;
+    for (int i = 0; i < frames; i++) {
+      ambLevel += (target - ambLevel) * lk;                   // per-frame ease
+      float s = 0;
+      if (ambWr - ambRd > 2) {
+        int16_t a = ambRing[ambRd & (AMB_RING - 1)];
+        int16_t b = ambRing[(ambRd + 1) & (AMB_RING - 1)];
+        s = (a + (b - a) * ambPos) * ambLevel * BED_SCALE;
+        ambPos += step;
+        while (ambPos >= 1.0f) { ambPos -= 1.0f; ambRd++; }
+      }
+      buf[i * 2]     = (int32_t)constrain((float)buf[i * 2]     + s, -PCM_FS, PCM_FS);
+      buf[i * 2 + 1] = (int32_t)constrain((float)buf[i * 2 + 1] + s, -PCM_FS, PCM_FS);
     }
-    buf[i * 2]     = (int32_t)constrain((float)buf[i * 2]     + s, -PCM_FS, PCM_FS);
-    buf[i * 2 + 1] = (int32_t)constrain((float)buf[i * 2 + 1] + s, -PCM_FS, PCM_FS);
   }
+
+  // Last stage: radio + bed together, so the knob lifts the whole mix.
+  volBoostApply(buf, frames);
 }
 
 // ── Audio task (core 1, away from WiFi) ──────────────────
