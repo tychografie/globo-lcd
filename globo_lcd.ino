@@ -51,6 +51,7 @@ using fs::FS;          // TFT_eSPI defines FS_NO_GLOBALS on S3, undo it
 #include <time.h>
 #include <qrcode.h>    // Espressif's esp_qrcode API (in core)
 #include <FFat.h>      // 9MB fat partition holds the soundscape loops
+#include <Update.h>    // OTA firmware writes (/api/ota)
 #include "Audio.h"     // ESP32-audioI2S by schreibfaul1 (3.4.x)
 #include <esp_sleep.h>
 #include <esp_wifi.h>
@@ -3254,6 +3255,48 @@ void webSetup() {
     delay(200);
     ESP.restart();
   });
+  // Firmware OTA — no need to crack the enclosure open. tools/ota.sh does
+  // the whole dance, or by hand:
+  //   arduino-cli compile ... --export-binaries
+  //   curl -F "file=@build/.../globo_lcd.ino.bin" http://globo.local/api/ota
+  // The app3M_fat9M_16MB scheme has two 3MB app slots; a failed or aborted
+  // upload leaves the running slot untouched.
+  server.on("/api/ota", HTTP_POST,
+    []() {
+      if (Update.hasError()) {
+        webSendJson(String("{\"ok\":false,\"err\":\"") +
+                    jsonEscape(Update.errorString()) + "\"}");
+        return;
+      }
+      webSendJson("{\"ok\":true,\"rebooting\":true}");
+      delay(300);
+      ESP.restart();
+    },
+    []() {
+      HTTPUpload& up = server.upload();
+      if (up.status == UPLOAD_FILE_START) {
+        // Flash erase/write stalls the cache on both cores, so a live
+        // stream would stutter itself to death: stop audio outright and
+        // park the bed reader for the duration.
+        g_uploadActive = true;
+        g_stopRequest = true;
+        delay(150);                     // let the audio task drain the stop
+        Serial.printf("[ota] start: %s\n", up.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+      } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (!Update.hasError() &&
+            Update.write(up.buf, up.currentSize) != up.currentSize)
+          Update.printError(Serial);
+      } else if (up.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) Serial.printf("[ota] done: %u bytes\n",
+                                            (unsigned)up.totalSize);
+        else Update.printError(Serial);
+        g_uploadActive = false;
+      } else if (up.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        g_uploadActive = false;
+      }
+    });
   server.on("/api/mode", []() {       // dev hatch: jump to any screen so a
     if (server.hasArg("m")) {         // framebuffer shot can capture it
       int m = server.arg("m").toInt();

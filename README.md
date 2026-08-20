@@ -7,7 +7,7 @@ Internet radio alarm clock for the **LilyGo T-Display-S3** (ESP32-S3, 8MB
 PSRAM) with a MAX98357 I2S amplifier. This is the merge of three earlier
 prototypes — [globo-eink](https://github.com/tychografie/globo-eink) (the
 alarm concept), the original globo-lcd (the visual identity), and tPod (the
-streaming engine). Full comparison and merge notes in [INVENTORY.md](INVENTORY.md).
+streaming engine). Parts list in [INVENTORY.md](INVENTORY.md).
 
 ## What it does
 
@@ -34,20 +34,27 @@ streaming engine). Full comparison and merge notes in [INVENTORY.md](INVENTORY.m
 - MAX98357 I2S Class D amplifier breakout (3W)
 - 3525 4Ω 3W speaker
 - EC11 / KY-040 rotary encoder
-- JST 1.25mm 2-pin 3.7V 1200mAh Li-Po battery
-- Panel-mount USB-C for power + flashing, wired to the onboard USB-C pads
+- 14500 Li-Ion cell, 3.7V 1600mAh (XH2.54 plug)
+- TP4057 USB-C charging board (1A, with cell protection) between the cell and
+  the board's 1.25mm battery connector — its USB-C is the external charge
+  port; it carries no data, so flashing happens on the onboard USB-C
+- SS12F15 SPDT slide switch as hard power switch, in the plus lead between
+  TP4057 OUT and the battery connector. Off still charges the cell via the
+  external USB-C; the onboard USB-C always powers the board regardless
 
 ### Pin map
 
-The amp lives on the P1 header (USB side), the encoder on the opposite P2
-header next to the 3V pin — the far end from the USB-C connector.
+The encoder and the amp share the header on the 3V3 side: encoder on 1/2/3
+next to the 3V3 pin (the far end from the USB-C), amp on 10/11/12 below it.
 
 | Signal | Pin | Notes |
 |---|---|---|
-| I2S BCLK / LRC / DOUT | 44 / 43 / 18 | UART pins, but serial runs over USB-CDC |
-| Encoder A / B / SW | 1 / 2 / 3 | P2 header top; module pull-ups or INPUT_PULLUP |
+| I2S BCLK / LRC / DOUT | 11 / 12 / 10 | DOUT drives the MAX98357 DIN |
+| Encoder A / B / SW | 1 / 2 / 3 | P2 header top; module pull-ups or INPUT_PULLUP. GPIO 3 is a strapping pin, but its JTAG strap is ignored with default efuses |
 | Buttons | 0 / 14 | onboard |
 | Battery ADC | 4 | internal 100k/100k divider |
+| Backlight PWM | 38 | internal (TFT_BL) |
+| LCD power enable | 15 | internal |
 | MAX98357 SD | tie to VIN | always enabled |
 
 ## Controls
@@ -108,19 +115,44 @@ Copy `User_Setup.h` from this repo to
 parallel config).
 
 The T-Display-S3 board definition sets `psram_type=opi` but not
-`-DBOARD_HAS_PSRAM`, so PSRAM fails to initialize without an override:
+`-DBOARD_HAS_PSRAM`, so PSRAM fails to initialize without an override.
+
+It also hardcodes `cdc_on_boot=1` — unlike the generic `esp32s3` board, this
+one defaults USB CDC On Boot to *Enabled*, which is the WiFi-deafening mode
+the sketch header warns about. `CDCOnBoot=default` (Disabled) must be pinned
+on the FQBN for both compile and upload, or inbound connections — web remote,
+mDNS, `/api/ota` — stop answering:
 
 ```bash
 arduino-cli compile \
-  --fqbn "esp32:esp32:lilygo_t_display_s3" \
+  --fqbn "esp32:esp32:lilygo_t_display_s3:CDCOnBoot=default" \
   --build-property "build.defines=-DBOARD_HAS_PSRAM" \
   globo_lcd/
 
 arduino-cli upload \
-  --fqbn esp32:esp32:lilygo_t_display_s3 \
+  --fqbn "esp32:esp32:lilygo_t_display_s3:CDCOnBoot=default" \
   --port /dev/cu.usbmodem1101 \
   globo_lcd/
 ```
+
+With CDC off the console is UART0, not USB — live telemetry comes from the
+UDP heartbeat (port 9909) and `/api/status` instead.
+
+### OTA (flash over WiFi)
+
+Once a build with `/api/ota` is on the device, the enclosure never has to
+open again for firmware:
+
+```bash
+globo_lcd/tools/ota.sh              # builds + uploads to globo.local
+globo_lcd/tools/ota.sh 192.168.1.7  # or by IP if mDNS is being mDNS
+```
+
+Audio stops during the write (~30s), then the device reboots into the new
+firmware. The 16MB scheme has two 3MB app slots, so a failed or aborted
+upload leaves the running firmware untouched — but a build that *boots and
+then crashes* still needs the USB cable, so try new firmware over USB when
+the change is risky.
 
 ## Stations
 
