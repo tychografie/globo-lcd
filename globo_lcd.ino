@@ -1688,8 +1688,16 @@ void updateBattery() {
   if (nowMs < 120000) { trendRef = g_batMvEma; trendMs = nowMs; }
   else if (nowMs - trendMs >= 60000) {
     float d = g_batMvEma - trendRef;
-    if      (d >=   8.0f) g_batCharging = true;
-    else if (d <= -15.0f) g_batCharging = false;
+    // A rise can only be a charger. But FLAT counts too, and that turns out to
+    // matter more: boot onto an already-full cell and there is no rise left to
+    // catch — which is exactly how the first version sat through six minutes of
+    // a plugged-in charger insisting nothing was happening. Under load this
+    // cell falls 1.8mV/s, so -108mV over the window. Holding within a few mV
+    // while the radio is playing means something is propping it up, and the
+    // only candidate is the charger.
+    if      (d >=   8.0f)                     g_batCharging = true;
+    else if (d >   -3.0f && audio.isRunning()) g_batCharging = true;
+    else if (d <= -15.0f)                     g_batCharging = false;
     trendRef = g_batMvEma;
     trendMs  = nowMs;
   }
@@ -2415,31 +2423,24 @@ void ambService() {
 // sits at unity, so the extra can only be digital gain — and this hook is
 // pre-volume, so it rides the knob and the tone preset like everything else.
 // Factors are simply secret/shown: 91/90, 100/95, 110/100.
+// Only the detents that still HAVE headroom get lifted. At 21/21 the library
+// sits at unity — there is nothing left to give, and asking for 110% there
+// does not make it louder, it just reshapes the peaks. A knee that bends per
+// sample is a waveshaper, not a limiter: it manufactures harmonics, and at
+// full volume that is exactly what it sounded like. 19 and 20 are still
+// attenuated by the library, so their lift lands in real headroom and stays
+// clean. Max volume is now bit-exact untouched again.
 #define VOL_BOOST_FROM 19                    // first boosted detent (shows 90)
-static const float VOL_BOOST[] = {1.011f, 1.053f, 1.100f};
-
-// Straight gain would just slam into the ±PCM_FS clamp and turn peaks into
-// hard-clip crackle — which is exactly what you'd notice first at full volume.
-// Above the knee we bend instead: x/(1+x) approaches the ceiling but never
-// reaches it, costs one divide, and only touches samples already up there.
-#define VOL_KNEE      (0.80f * PCM_FS)
+static const float VOL_BOOST[] = {1.011f, 1.053f, 1.000f};
 
 static void volBoostApply(int32_t* buf, int16_t frames) {
   int idx = volumeLevel - VOL_BOOST_FROM;
   if (idx < 0) return;                       // below 90%: untouched, bit-exact
   if (idx > 2) idx = 2;
   const float g = VOL_BOOST[idx];
-  const float head = PCM_FS - VOL_KNEE;
-  for (int i = 0; i < 2 * frames; i++) {
-    float v = (float)buf[i] * g;
-    float a = fabsf(v);
-    if (a > VOL_KNEE) {                      // soft knee, not a wall
-      float x = (a - VOL_KNEE) / head;
-      a = VOL_KNEE + head * (x / (1.0f + x));
-      v = v < 0 ? -a : a;
-    }
-    buf[i] = (int32_t)v;
-  }
+  if (g <= 1.0f) return;                     // full volume: hands off entirely
+  for (int i = 0; i < 2 * frames; i++)
+    buf[i] = (int32_t)constrain((float)buf[i] * g, -PCM_FS, PCM_FS);
 }
 
 void audio_process_raw_samples(int32_t* buf, int16_t frames) {
