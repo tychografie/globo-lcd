@@ -1643,17 +1643,29 @@ void renderFrame() {
 // charger lifts the rail toward 4.2-4.35V, so the estimate runs optimistic —
 // physics, not fixable without a gauge chip.
 void updateBattery() {
-  int pinMv = analogReadMilliVolts(PIN_BAT_ADC);
+  // The S3 ADC is noisy enough that one conversion visibly moves the estimate,
+  // and the envelope below would happily latch onto a single high outlier.
+  // Median of 7 costs microseconds and makes that impossible.
+  int s[7];
+  for (int i = 0; i < 7; i++) s[i] = analogReadMilliVolts(PIN_BAT_ADC);
+  for (int i = 1; i < 7; i++)
+    for (int j = i; j > 0 && s[j - 1] > s[j]; j--) { int t = s[j]; s[j] = s[j - 1]; s[j - 1] = t; }
+  int pinMv = s[3];
   int raw = pinMv * 2;   // undo the 100k/100k divider
   // USB just unplugged: the EMA is parked at the 4.86V rail. Snap straight
   // to the cell instead of decaying through the whole curve — the decay
   // briefly read as a "100%..50% battery" and poisoned the learning.
   if (g_batMvEma >= 4500.0f && raw < 4400) g_batMvEma = (float)raw;
   if (g_batMvEma == 0.0f) g_batMvEma = (float)raw;
-  // Slow EMA (~20s time constant at 1Hz): WiFi TX bursts sag the cell tens
-  // of mV every second, and the curve's steep middle turned that into a
-  // 41..48% ping-pong (Tycho). The battery itself changes over hours.
-  else g_batMvEma = 0.95f * g_batMvEma + 0.05f * (float)raw;
+  // Asymmetric on purpose. Load only ever pulls a cell DOWN: measured 131mV of
+  // sag on this 14500 the instant radio and WiFi come up after a reboot, which
+  // the curve turns into 19 points of "empty" that were never gone. What maps
+  // to state of charge is the RESTING voltage, so track the top of the ripple —
+  // climb fast toward a higher reading, give way slowly to a lower one. A real
+  // discharge still falls (~100s constant); it just stops chasing every TX
+  // burst and every loud passage down the curve.
+  else if (raw > g_batMvEma) g_batMvEma += ((float)raw - g_batMvEma) * 0.25f;
+  else                       g_batMvEma += ((float)raw - g_batMvEma) * 0.01f;
   int mv = (int)g_batMvEma;
   if (mv >= 4500) { g_batPct = -1; return; }   // USB rail — the cell is invisible
   static const int   CURVE_MV[]  = {3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200};
@@ -1671,9 +1683,16 @@ void updateBattery() {
       }
     }
   }
-  // ±1% display hysteresis on top of the slow EMA: the number only moves
-  // when the estimate really moved.
-  if (g_batPct < 0 || abs(pct - g_batPct) >= 2) g_batPct = pct;
+  // A ±1 deadband that then SNAPS to the new estimate is what made the number
+  // leap: measured on a charging cell, 4129mV → 4130mV moved the display 91 →
+  // 93 in one tick, because the deadband holds until the estimate is 2 points
+  // away and then jumps the whole gap at once. It can never move by 1.
+  // Keep the deadband — it is what kills the WiFi-sag flicker — but walk one
+  // point per second toward the estimate instead of teleporting to it. A cell
+  // charges over hours, so 1%/s is far quicker than anything real.
+  if (g_batPct < 0)             g_batPct = pct;   // first read, or back from USB
+  else if (pct >= g_batPct + 2) g_batPct++;
+  else if (pct <= g_batPct - 2) g_batPct--;
 }
 
 // ── Screen timeout / backlight (tPod) ────────────────────
