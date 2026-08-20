@@ -1682,7 +1682,10 @@ void updateBattery() {
   static float    trendRef = 0.0f;
   static uint32_t trendMs  = 0;
   uint32_t nowMs = millis();
-  if (trendRef <= 0.0f) { trendRef = g_batMvEma; trendMs = nowMs; }
+  // Sit out the first two minutes. The cell climbs ~100mV right after a reboot
+  // as the boot surge passes, and to a trend detector that is indistinguishable
+  // from a charger — it produced exactly that false positive in testing.
+  if (nowMs < 120000) { trendRef = g_batMvEma; trendMs = nowMs; }
   else if (nowMs - trendMs >= 60000) {
     float d = g_batMvEma - trendRef;
     if      (d >=   8.0f) g_batCharging = true;
@@ -1715,9 +1718,19 @@ void updateBattery() {
   // Keep the deadband — it is what kills the WiFi-sag flicker — but walk one
   // point per second toward the estimate instead of teleporting to it. A cell
   // charges over hours, so 1%/s is far quicker than anything real.
-  if (g_batPct < 0)             g_batPct = pct;   // first read, or back from USB
-  else if (pct >= g_batPct + 2) g_batPct++;
-  else if (pct <= g_batPct - 2) g_batPct--;
+  // Climbing is rate-limited while charging. The charger holds the terminal
+  // voltage up, so the curve reads far more charge than the cell actually
+  // holds — measured 19% to 92% in three minutes, which no 1600mAh cell can do
+  // at 1A. Now that charging is known, cap the climb at what is physically
+  // possible: ~1 point per 45s is a full charge in about ninety minutes. You
+  // still see progress, it just cannot run away and then crash back down the
+  // moment you unplug. Falling is never limited — that direction is honest.
+  static uint8_t climbTick = 0;
+  if (g_batPct < 0) { g_batPct = pct; climbTick = 0; }   // first read, or back from USB
+  else if (pct >= g_batPct + 2) {
+    if (!g_batCharging || ++climbTick >= 45) { g_batPct++; climbTick = 0; }
+  }
+  else if (pct <= g_batPct - 2) { g_batPct--; climbTick = 0; }
 }
 
 // ── Screen timeout / backlight (tPod) ────────────────────
