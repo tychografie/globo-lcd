@@ -1,0 +1,60 @@
+{
+  "schema": "globo-hardware-index/1",
+  "readme": "README.md",
+  "units": "mm",
+  "design": {
+    "name": "GloboTest",
+    "fusion_file": "cad/GloboTest.f3d",
+    "fusion_version": 60,
+    "saved_utc": "2026-11-02T11:54:48Z",
+    "neutral_export_date": "2026-11-06"
+  },
+  "coordinates": {
+    "frame": "Fusion root frame. All files in model/ share it, so they line up when loaded together.",
+    "x": "Across the device. The casing spans 92.56 to 135.13.",
+    "y": "Along the device. Knob end at y=-5, USB end at y=80.",
+    "z": "Up. The flat base with the lid opening is at z=0, the rounded ridge at z=39.02.",
+    "cross_section": "Rounded triangle: flat base, speaker behind the -X wall, LilyGo board in the +X window, battery along the base."
+  },
+  "assembly": [
+    {"part": "enclosure", "fusion_body": "PRINT_01_Enclosure_USBV", "kind": "printed", "accuracy": "exact", "bbox_mm": [92.56, -5.0, 0.0, 135.13, 80.0, 39.02]},
+    {"part": "tp4057_sokkel_v6", "fusion_body": "PRINT_V6_Sokkel_compact", "kind": "printed", "accuracy": "exact", "bbox_mm": [109.52, 73.0, 9.5, 124.6, 78.0, 24.5], "note": "Holds the TP4057 board at the USB end. Design-of-record sokkel; variants A-D are in print/2026-10-29_tp4057_sokkel."},
+    {"part": "encoder_ec11", "fusion_body": "EC11", "kind": "electronics", "accuracy": "modelled", "bbox_mm": [102.09, -15.0, 5.98, 125.59, 9.1, 29.48]},
+    {"part": "battery_14500", "fusion_body": "Battery 14500", "kind": "electronics", "accuracy": "modelled", "bbox_mm": [108.0, 12.0, 2.19, 122.0, 62.0, 16.19]},
+    {"part": "speaker_3525", "fusion_body": "Speaker", "kind": "electronics", "accuracy": "modelled", "bbox_mm": [96.49, 13.0, 7.28, 114.15, 48.0, 31.93]},
+    {"part": "amp_max98357", "fusion_body": "Audio", "kind": "electronics", "accuracy": "stand-in", "bbox_mm": [98.55, 50.0, 7.4, 115.67, 67.5, 32.15], "note": "Fusion calls this body 'Audio'. Identified as the MAX98357 from its place next to the speaker and INVENTORY.md; the design does not say so."},
+    {"part": "lilygo_board_placeholder", "fusion_body": "PCB_Placeholder_62x25x10", "kind": "electronics", "accuracy": "stand-in", "bbox_mm": [118.13, 12.1, 9.83, 132.36, 66.0, 32.48], "note": "A plain 53.9 x 25 x 2 slab tilted 60 degrees, not a model of the board. Despite the Fusion name it is not 62 long. For the real board's extent see lilygo reference under excluded_third_party."},
+    {"part": "tp4057_board", "fusion_body": "OLD_TP4057_placeholder_hidden", "kind": "electronics", "accuracy": "stand-in", "bbox_mm": [111.01, 61.2, 11.0, 115.47, 81.5, 23.0], "note": "Self-made stand-in from before the V6 sokkel. See known_model_issues."}
+  ],
+  "print_layout_parts": {
+    "note": "Laid out flat for printing, not in their assembled position. The design does not record where they sit assembled.",
+    "parts": ["lid", "knob_spiral", "knob_fluted", "knob_facet", "knob_coinedge", "knob_stocktest"]
+  },
+  "not_modelled": [
+    {"part": "SS12F15 slide switch", "note": "In the device per INVENTORY.md, but there is no body for it in the design."}
+  ],
+  "excluded_third_party": [
+    {"fusion_body": "V6_TP4057_echt_ref", "what": "'Charging Module TP4057 Mini' community STEP model, placed in the device", "bbox_mm": [111.17, 59.89, 11.0, 115.76, 80.0, 23.0], "licence": "unknown", "note": "The accurate TP4057 extent. Use these bounds rather than tp4057_board for fit work."},
+    {"fusion_body": "t_display_s3_touch_Edited", "what": "LilyGo reference mesh, hidden in the design. It is the touch variant; the device uses the non-touch board.", "bbox_mm": [112.91, 11.8, 6.84, 128.16, 73.78, 30.73], "licence": "unknown"},
+    {"fusion_body": "MeshBody1_Solid", "what": "'Knob - Rotary encoder EC11 15mm' by Pokzy, not part of the device layout", "bbox_mm": [118.0, 118.0, 0.0, 138.0, 138.0, 13.4], "licence": "Standard Digital File License"}
+  ],
+  "known_model_issues": [
+    {"issue": "Stand-ins overlap, which does not reflect the real device.", "overlaps_mm3": {"battery_14500 + amp_max98357": 240.0, "tp4057_board + tp4057_sokkel_v6": 26.3, "amp_max98357 + tp4057_board": 13.8, "battery_14500 + tp4057_board": 4.1}},
+    {"issue": "Lid seat is not pinned down. The base opening at z=0.5 spans x 102.6 to 125.1 and y 3.15 to 74.5 (22.5 x 71.35). The lid is 22.29 x 68.5, so the width fits but its position along y is not recorded."}
+  ],
+  "rules": [
+    {"match": "^cad/GloboTest\\.f3d$", "status": "current", "role": "Fusion design of record, v60. Includes third-party bodies and all history."},
+    {"match": "^cad/GloboTest_v2", "status": "archive", "role": "Early Fusion export, before the internals were added."},
+    {"match": "^model/assembly\\.", "status": "current", "role": "The eight assembled bodies together. Exact in STEP, meshed in STL."},
+    {"match": "^model/bodies/(enclosure|lid|knob_|tp4057_sokkel)", "status": "current", "role": "Printable part, in design coordinates."},
+    {"match": "^model/bodies/", "status": "current", "role": "Electronics reference geometry. Do not print."},
+    {"match": "^print/2026-10-29[^/]*/fusion_export/", "status": "current", "role": "Fusion export, identical mesh to model/bodies. Input to variants.py."},
+    {"match": "^print/2026-10-29[^/]*/in_position/sokkel_D", "status": "archive", "role": "Sokkel variant in assembly position. Earlier revision than the PRINT_ file."},
+    {"match": "^print/2026-10-29[^/]*/in_position/", "status": "variant", "role": "Sokkel variant in assembly position, for fit checks."},
+    {"match": "^print/2026-10-29[^/]*/casing_voor_D", "status": "variant", "role": "Casing that pairs with sokkel D."},
+    {"match": "^print/2026-10-29[^/]*/casing_voor_A", "status": "variant", "role": "Casing that pairs with sokkels A, B and C."},
+    {"match": "^print/2026-10-29", "status": "variant", "role": "Sokkel variant, oriented flat for printing."},
+    {"match": "^print/2026-07-15", "status": "superseded", "role": "July print set. Lid and spiral knob still match the design."},
+    {"match": "^print/archive/", "status": "archive", "role": "Older export, kept for history."}
+  ]
+}
